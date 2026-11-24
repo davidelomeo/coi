@@ -11,7 +11,7 @@ You can use `coi` from the command line on netCDF files, or from Python on any `
 > [!IMPORTANT]
 > The COI was developed with OLCI (Sentinel-3A/B) reflectance from the ESA Lake_cci v3 lake colour product, which is atmospherically corrected with **Polymer v4.17b**. The OWT library, the weights and the default Wsum range all come from that data. Reflectance from another atmospheric correction (or another sensor) may bias the COI, so use it with care.
 
-**Contents:** [Method](#method) · [Results from the paper](#results-from-the-paper) · [Installation](#installation) · [Input data](#input-data) · [Command line](#command-line) · [Python](#python) · [Custom weights and reference files](#custom-weights-and-reference-files) · [Tests](#tests) · [Citation](#citation)
+**Contents:** [Method](#method) · [Results from the paper](#results-from-the-paper) · [Installation](#installation) · [Input data](#input-data) · [Output](#output) · [Command line](#command-line) · [Python](#python) · [Custom weights and reference files](#custom-weights-and-reference-files) · [Tests](#tests) · [Citation](#citation)
 
 ---
 
@@ -29,7 +29,7 @@ The package ships the resulting 25-OWT library and weights, and applies the last
 4. **Weighted sum.** Wsum = Σᵢ Sowtᵢ · wᵢ · Pᵢ, where wᵢ is the weight of OWT *i*.
 5. **Index.** COI = (Wsum − min_wsum) / (max_wsum − min_wsum), clipped to [0, 1].
 
-The default range (`min_wsum = 223`, `max_wsum = 321`) was derived for OLCI. For other sensors or band sets, you may want to set your own range.
+The range is fixed: it is not taken from the Wsum values in your data, so COI values can be compared between scenes and dates. Wsum values outside the range give a COI of 0 or 1. The default range (`min_wsum = 223`, `max_wsum = 321`) was derived for OLCI. To use other boundaries, for example for other sensors or band sets, set `min_wsum` and `max_wsum` in Python, or `--min-wsum` and `--max-wsum` on the command line.
 
 ## Results from the paper
 
@@ -137,6 +137,22 @@ Sensor names are case-insensitive. With **custom bands** (`bands=[...]` or `-b`)
 
 ---
 
+## Output
+
+The output has the same coordinates as the input, and these variables:
+
+| Variable | Description |
+|---|---|
+| `wsum` | Weighted sum of the OWT membership scores (Wsum) |
+| `coi` | Cyanobacteria Occurrence Index, between 0 and 1 |
+| `dominant_owt_1`, `dominant_owt_2`, `dominant_owt_3` | Names of the three OWTs with the highest membership scores (Sowt), from highest to lowest, for example `6.2` |
+| `sowt_<OWT>` | Membership score of each OWT, between 0 and 1 (only with `return_all` / `--return-all`) |
+| `Rw*` | The input bands (only with `return_all` / `--return-all`) |
+
+Pixels without a result (see [Input data](#input-data)) are NaN in the numeric variables and empty text (`''`) in the `dominant_owt_*` variables. In netCDF files, the OWT names are stored as compact character arrays, and xarray reads them back as text.
+
+---
+
 ## Command line
 
 ```bash
@@ -189,10 +205,7 @@ result = COI(ds, sensor="OLCI").process_spectral_data()
 result.to_netcdf("output.nc")
 ```
 
-`result` is an `xarray.Dataset` with the same coordinates as `ds` and two variables:
-
-- `wsum`: weighted sum of the OWT membership scores
-- `coi`: Cyanobacteria Occurrence Index, between 0 and 1
+`result` is an `xarray.Dataset` with `wsum`, `coi` and `dominant_owt_1` to `dominant_owt_3` (see [Output](#output)). For a table with one row per pixel, use `result.to_dataframe()`.
 
 ### Options
 
@@ -219,6 +232,8 @@ result = COI(
 ```
 
 With `return_all=True`, the result also contains every `Rw*` variable of the input and one `sowt_<OWT>` variable per reference OWT (for example `sowt_1.2`). Each `sowt_*` score is between 0 and 1, and 1 means the spectrum has exactly the shape of that OWT.
+
+`min_wsum` and `max_wsum` set the Wsum values that map to COI = 0 and COI = 1. They are fixed boundaries, not taken from your data (see [Method](#method)).
 
 ### Large files (dask)
 

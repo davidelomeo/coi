@@ -19,6 +19,7 @@ CORE = files('coi') / 'core_files'
 REFERENCE = pd.read_csv(CORE / 'OWT_inland_mean_standardised_extended.csv', index_col='wl')
 WEIGHTS = json.loads((CORE / 'w_owt.json').read_text())
 OLCI = COI.SENSOR_BANDS['OLCI']
+DOMINANT = ['dominant_owt_1', 'dominant_owt_2', 'dominant_owt_3']
 MODIS_RENAME = {k: v for k, v in COI.MODIS_BAND_MAP.items() if k != v}
 
 
@@ -42,8 +43,8 @@ def ds():
     return scene
 
 
-def slow_reference(spectrum, bands, reference, weights, min_wsum=223.0, max_wsum=321.0, exp=1.0):
-    """Plain, one-pixel implementation of the method, used to check the fast version."""
+def slow_scores(spectrum, bands, reference):
+    """Plain, one-pixel implementation of the OWT membership scores (Sowt)."""
     wl = np.array([float(b[2:]) for b in bands])
     order = np.argsort(wl)
     x = np.asarray(spectrum, dtype=float)
@@ -54,7 +55,12 @@ def slow_reference(spectrum, bands, reference, weights, min_wsum=223.0, max_wsum
         r = r / _trapezoid(r[order], wl[order])
         cos = np.dot(x, r) / (np.linalg.norm(x) * np.linalg.norm(r))
         scores.append(1 - np.arccos(np.clip(cos, -1, 1)) / np.pi)
-    scores = np.array(scores)
+    return np.array(scores)
+
+
+def slow_reference(spectrum, bands, reference, weights, min_wsum=223.0, max_wsum=321.0, exp=1.0):
+    """Plain, one-pixel implementation of Wsum and COI, used to check the fast version."""
+    scores = slow_scores(spectrum, bands, reference)
     w = np.array([weights['sowt_' + c.split('OWT_')[1]] for c in reference.columns])
     fractions = scores ** exp / np.sum(scores ** exp)
     wsum = np.sum(scores * w * fractions)
@@ -76,8 +82,8 @@ def test_matches_plain_implementation(ds, kwargs):
 
 def test_output_structure(ds):
     out = COI(ds, sensor='OLCI').process_spectral_data()
-    assert list(out.data_vars) == ['wsum', 'coi']
-    assert out['coi'].dims == ('y', 'x')
+    assert list(out.data_vars) == ['wsum', 'coi'] + DOMINANT
+    assert all(out[v].dims == ('y', 'x') for v in out.data_vars)
     np.testing.assert_array_equal(out['y'], ds['y'])
     valid = out['coi'].values[~np.isnan(out['coi'].values)]
     assert valid.min() >= 0 and valid.max() <= 1
@@ -101,7 +107,41 @@ def test_return_all_contents(ds):
     sowt = [v for v in out.data_vars if v.startswith('sowt_')]
     assert len(sowt) == REFERENCE.shape[1]
     assert set(OLCI) <= set(out.data_vars)
-    assert list(out.data_vars)[-2:] == ['wsum', 'coi']
+    assert list(out.data_vars)[-5:] == ['wsum', 'coi'] + DOMINANT
+
+
+def test_dominant_owts_are_the_highest_scores(ds):
+    out = COI(ds, sensor='OLCI').process_spectral_data()
+    names = [c.split('OWT_')[1] for c in REFERENCE.columns]
+    for y, x in [(1, 1), (5, 7), (11, 14)]:
+        scores = slow_scores(spectrum_at(ds, OLCI, y, x), OLCI, REFERENCE)
+        expected = [names[i] for i in np.argsort(-scores)[:3]]
+        assert [str(out[v][y, x].values) for v in DOMINANT] == expected
+
+
+def test_dominant_owts_reference_and_missing(ds):
+    for band in OLCI:
+        ds[band][3, 3] = REFERENCE.loc[band, 'OWT_5'] * 0.02
+    out = COI(ds, sensor='OLCI').process_spectral_data()
+    assert str(out['dominant_owt_1'][3, 3].values) == '5'
+    for var in DOMINANT:
+        assert str(out[var][0, 0].values) == '' and str(out[var][0, 1].values) == ''
+        assert (out[var].values[1:, :] != '').all()
+
+
+def test_fewer_owts_than_three(ds):
+    reference = REFERENCE[['OWT_5', 'OWT_13']]
+    weights = {'sowt_5': 100, 'sowt_13': 0}
+    out = COI(ds, sensor='OLCI', w_owt=weights, reference_owt=reference).process_spectral_data()
+    assert list(out.data_vars) == ['wsum', 'coi', 'dominant_owt_1', 'dominant_owt_2']
+
+
+def test_outputs_do_not_inherit_input_attributes(ds):
+    ds['Rw412'].attrs['units'] = 'sr-1'
+    out = COI(ds, sensor='OLCI', return_all=True).process_spectral_data()
+    assert out['Rw412'].attrs == {'units': 'sr-1'}
+    for var in ['wsum', 'coi', 'sowt_5'] + DOMINANT:
+        assert 'units' not in out[var].attrs
 
 
 def test_blocks_give_same_result(ds, monkeypatch):
@@ -212,8 +252,10 @@ def test_cli(ds, tmp_path):
 
     main(['-i', str(src), '-o', str(tmp_path / 'a.nc'), '-s', 'olci', '--exp', '2', '--min-wsum', '200', '--max-wsum', '300'])
     with xr.open_dataset(tmp_path / 'a.nc') as out:
-        assert list(out.data_vars) == ['wsum', 'coi']
+        assert list(out.data_vars) == ['wsum', 'coi'] + DOMINANT
         np.testing.assert_allclose(out['coi'], expected['coi'])
+        for var in DOMINANT:
+            np.testing.assert_array_equal(out[var].values.astype(str), expected[var].values)
 
     main(['-i', str(src), '-o', str(tmp_path / 'b.nc'), '-s', 'OLCI', '--return-all'])
     with xr.open_dataset(tmp_path / 'b.nc') as out:
@@ -228,3 +270,17 @@ def test_cli_failure_exits_nonzero(tmp_path):
     with pytest.raises(SystemExit) as exc:
         main(['-i', str(tmp_path / 'missing.nc'), '-o', str(tmp_path / 'x.nc'), '-s', 'OLCI'])
     assert exc.value.code == 1
+
+
+def test_cli_text_conversion_round_trips(tmp_path):
+    from coi.cli import _ascii_text_as_bytes
+    ds = xr.Dataset({'ascii': (('y', 'x'), np.array([['6.2', ''], ['1.1_7.1', '13']])),
+                     'other': (('y', 'x'), np.array([['é', 'x'], ['', 'ü1']]))})
+    for var in ds.data_vars:
+        ds[var].encoding = {'dtype': 'S1'}
+    converted = _ascii_text_as_bytes(ds)
+    assert converted['ascii'].dtype.kind == 'S' and converted['other'].dtype.kind == 'U'
+    converted.to_netcdf(tmp_path / 't.nc', encoding={v: converted[v].encoding for v in converted.data_vars})
+    with xr.open_dataset(tmp_path / 't.nc') as back:
+        for var in ds.data_vars:
+            np.testing.assert_array_equal(back[var].values.astype(str), ds[var].values)

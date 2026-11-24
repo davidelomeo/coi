@@ -61,7 +61,7 @@ def calculate_wsum_and_coi(ds: xarray.Dataset, w_owt: dict, min_wsum: float, max
         wsum_and_coi, scores,
         kwargs=dict(weights=weights, min_wsum=float(min_wsum), max_wsum=float(max_wsum), exp=float(exp)),
         input_core_dims=[['sowt']], output_core_dims=[[], []],
-        dask='parallelized', output_dtypes=[float, float])
+        dask='parallelized', keep_attrs=False, output_dtypes=[float, float])
 
     ds['wsum'] = wsum
     ds['coi'] = coi

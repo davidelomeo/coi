@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coi"
-version = "0.2.0"
+version = "0.3.0"
 description = "Compute the Cyanobacteria Occurrence Index (COI) from satellite water reflectance"
 readme = "README.md"
 license = { file = "LICENSE" }

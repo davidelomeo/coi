@@ -19,6 +19,9 @@ _CORE_FILES = files('coi') / 'core_files'
 # Pixels are processed in blocks of this many, so memory use does not grow with the scene size
 _BLOCK_SIZE = 262_144
 
+# Number of most similar OWTs reported for each pixel (dominant_owt_1, dominant_owt_2, ...)
+N_DOMINANT = 3
+
 
 class COI:
     """Compute the Cyanobacteria Occurrence Index (COI) from satellite data.
@@ -50,6 +53,9 @@ class COI:
         Boolean mask; pixels where it is False are returned as NaN.
     return_all : bool
         If True, also return the input 'Rw*' bands and every 'sowt_*' score.
+
+    The output always contains 'wsum', 'coi' and the names of the three OWTs with the
+    highest membership scores ('dominant_owt_1' to 'dominant_owt_3').
     """
 
     SENSOR_BANDS = {
@@ -167,17 +173,24 @@ class COI:
         Returns
         -------
         xarray.Dataset
-            'wsum' and 'coi'; with ``return_all=True`` also the input 'Rw*' bands and the
-            'sowt_*' scores.
+            'wsum', 'coi' and 'dominant_owt_1' to 'dominant_owt_3' (names of the OWTs with
+            the highest Sowt, '' where there is no result). With ``return_all=True`` also
+            the input 'Rw*' bands and the 'sowt_*' scores.
         """
         sowt_names = self._sowt_names()
         sort_idx, sorted_wavelengths, ref_standardised = prepare_reference(self.bands, self.reference_owt)
+
+        n_dominant = min(N_DOMINANT, len(sowt_names))
+        # OWT names as in 'sowt_<name>'; the extra '' is looked up for pixels without a result
+        name_lookup = numpy.array([name[len('sowt_'):] for name in sowt_names] + [''])
 
         inputs = [self.ds[name] for name in self._band_variables()]
         if self.valid_mask is not None:
             inputs.append(self.valid_mask)
 
-        n_outputs = 3 if self.return_all else 2
+        # Outputs: wsum, coi, one array per dominant OWT rank and, with return_all, all scores
+        output_core_dims = [[]] * (2 + n_dominant) + ([['owt']] if self.return_all else [])
+        output_dtypes = [float, float] + [name_lookup.dtype] * n_dominant + ([float] if self.return_all else [])
         logger.info('Computing spectral angle, Wsum and COI')
         outputs = xarray.apply_ufunc(
             _coi_kernel, *inputs,
@@ -190,11 +203,14 @@ class COI:
                 min_wsum=self.min_wsum,
                 max_wsum=self.max_wsum,
                 exp=self.exp,
+                name_lookup=name_lookup,
+                n_dominant=n_dominant,
                 return_scores=self.return_all),
             input_core_dims=[[] for _ in inputs],
-            output_core_dims=[[], [], ['owt']][:n_outputs],
+            output_core_dims=output_core_dims,
             dask='parallelized',
-            output_dtypes=[float] * n_outputs,
+            keep_attrs=False,  # input attributes (e.g. units) do not apply to the outputs
+            output_dtypes=output_dtypes,
             dask_gufunc_kwargs={'output_sizes': {'owt': len(sowt_names)}} if self.return_all else None)
 
         wsum, coi = outputs[0], outputs[1]
@@ -209,16 +225,24 @@ class COI:
                     band.encoding = {}
                     variables[var] = band
             for i, name in enumerate(sowt_names):
-                variables[name] = outputs[2].isel(owt=i)
+                variables[name] = outputs[-1].isel(owt=i)
         variables['wsum'] = wsum
         variables['coi'] = coi
+        for rank in range(n_dominant):
+            dominant = outputs[2 + rank]
+            dominant.attrs['long_name'] = f'OWT with the {_ORDINALS[rank]} highest membership score (Sowt)'
+            dominant.encoding = {'dtype': 'S1'}  # compact fixed-width characters in netCDF files
+            variables[f'dominant_owt_{rank + 1}'] = dominant
 
         return xarray.Dataset(variables, coords=self.ds.coords)
 
 
+_ORDINALS = ['1st', '2nd', '3rd'] + [f'{n}th' for n in range(4, 21)]
+
+
 def _coi_kernel(*arrays, has_mask, sort_idx, sorted_wavelengths, ref_standardised, weights,
-                min_wsum, max_wsum, exp, return_scores):
-    """Wsum, COI (and optionally all scores) for numpy band arrays of any shape.
+                min_wsum, max_wsum, exp, name_lookup, n_dominant, return_scores):
+    """Wsum, COI, dominant OWT names (and optionally all scores) for numpy band arrays of any shape.
 
     Only pixels with finite values in every band (and inside the mask) are computed; the
     rest are NaN. Pixels are processed in blocks to keep memory use bounded.
@@ -236,6 +260,7 @@ def _coi_kernel(*arrays, has_mask, sort_idx, sorted_wavelengths, ref_standardise
 
     wsum = numpy.full(n_pixels, numpy.nan)
     coi = numpy.full(n_pixels, numpy.nan)
+    dominant = numpy.full((n_dominant, n_pixels), -1, dtype=numpy.int16)  # -1 -> ''
     scores = numpy.full((n_pixels, n_owt), numpy.nan) if return_scores else None
 
     for start in range(0, n_pixels, _BLOCK_SIZE):
@@ -250,10 +275,27 @@ def _coi_kernel(*arrays, has_mask, sort_idx, sorted_wavelengths, ref_standardise
         index = start + numpy.flatnonzero(valid)
         block_scores = spectral_scores(spectra[valid], sort_idx, sorted_wavelengths, ref_standardised)
         wsum[index], coi[index] = wsum_and_coi(block_scores, weights, min_wsum, max_wsum, exp)
+        dominant[:, index] = _top_columns(block_scores, n_dominant)
         if return_scores:
             scores[index] = block_scores
 
     outputs = (wsum.reshape(shape), coi.reshape(shape))
+    outputs += tuple(name_lookup[codes].reshape(shape) for codes in dominant)
     if return_scores:
         outputs += (scores.reshape(shape + (n_owt,)),)
     return outputs
+
+
+def _top_columns(scores: numpy.ndarray, n: int) -> numpy.ndarray:
+    """Columns of the ``n`` highest scores in each row, shape (n, rows); -1 for rows with NaN.
+
+    Ties go to the first column, i.e. the order of the reference library.
+    """
+    remaining = scores.copy()
+    rows = numpy.arange(len(scores))
+    top = numpy.empty((n, len(scores)), dtype=numpy.int16)
+    for rank in range(n):
+        top[rank] = best = numpy.argmax(remaining, axis=1)
+        remaining[rows, best] = -numpy.inf
+    top[:, numpy.isnan(scores).any(axis=1)] = -1
+    return top

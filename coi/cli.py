@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
+import numpy
 import pandas
 import xarray
 
@@ -52,6 +53,27 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(args)
 
 
+def _ascii_text_as_bytes(ds: xarray.Dataset) -> xarray.Dataset:
+    """Convert in-memory ASCII text variables to bytes, ready to be written to netCDF.
+
+    xarray converts text to bytes one value at a time, which takes seconds on large scenes.
+    For ASCII text (such as OWT names) the whole array can be converted at once. The file
+    is the same either way: the '_Encoding' attribute makes xarray read the values back as
+    text. Anything else is left for xarray to convert.
+    """
+    ds = ds.copy()
+    for name, var in ds.data_vars.items():
+        if var.dtype.kind != 'U' or var.chunks is not None or var.ndim == 0 or var.dtype.itemsize == 0:
+            continue
+        code_points = numpy.ascontiguousarray(var.values).view(numpy.uint32)
+        if code_points.size and code_points.max() >= 128:
+            continue
+        as_bytes = code_points.astype(numpy.uint8).view(f'S{var.dtype.itemsize // 4}')
+        ds[name] = xarray.Variable(var.dims, as_bytes, attrs={**var.attrs, '_Encoding': 'utf-8'},
+                                   encoding=var.encoding)
+    return ds
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     """Run the COI calculation from the command line."""
     args = parse_args(argv)
@@ -92,7 +114,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         logger.info(f'Saving to {output_path}')
-        encoding = {var: {'zlib': True, 'complevel': 5} for var in result_ds.data_vars}
+        result_ds = _ascii_text_as_bytes(result_ds)
+        # Keep each variable's own encoding (e.g. how text is stored) and add compression
+        encoding = {var: {**result_ds[var].encoding, 'zlib': True, 'complevel': 5}
+                    for var in result_ds.data_vars}
         result_ds.to_netcdf(output_path, encoding=encoding)
         logger.info('Processing completed successfully')
 
