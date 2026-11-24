@@ -1,77 +1,68 @@
-"""Module for calculating Weighted Sum and Cyanobacteria Occurrence Index."""
+"""Weighted sum of OWT membership scores (Wsum) and Cyanobacteria Occurrence Index (COI)."""
 
-import numpy
+from typing import Dict, List, Tuple
+
+import numpy as np
 import xarray
-import logging
 
-logger = logging.getLogger(__name__)
+__all__ = ['calculate_wsum_and_coi']
 
-def calculate_wsum_and_coi(
-    ds: xarray.Dataset,
-    w_owt: dict,
-    min_wsum: float,
-    max_wsum: float,
-    exp: float = 1.0
-) -> xarray.Dataset:
-    """
-    Calculate Weighted Sum and Cyano Occurrence Index (COI) for an xarray Dataset.
-    
+
+def owt_weights(sowt_names: List[str], w_owt: Dict) -> np.ndarray:
+    """Weights in the order of ``sowt_names``, with a clear error if any are missing."""
+    missing = [name for name in sowt_names if name not in w_owt]
+    if missing:
+        raise KeyError(f'OWT weights are missing entries for {missing}')
+    return np.array([w_owt[name] for name in sowt_names], dtype=float)
+
+
+def wsum_and_coi(scores: np.ndarray, weights: np.ndarray, min_wsum: float, max_wsum: float,
+                 exp: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Wsum and COI from scores of shape (..., n_owt). Points with any NaN score are NaN."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        valid = ~np.isnan(scores).any(axis=-1)
+
+        # Fractionality: each score's share of the (powered) total
+        powered = scores ** exp
+        fractions = powered / powered.sum(axis=-1, keepdims=True)
+
+        wsum = np.where(valid, np.nansum(scores * weights * fractions, axis=-1), np.nan)
+        coi = np.where(valid, np.clip((wsum - min_wsum) / (max_wsum - min_wsum), 0, 1), np.nan)
+    return wsum, coi
+
+
+def calculate_wsum_and_coi(ds: xarray.Dataset, w_owt: dict, min_wsum: float, max_wsum: float,
+                           exp: float = 1.0) -> xarray.Dataset:
+    """Calculate Wsum and COI from the 'sowt_*' variables of a Dataset.
+
     Parameters
     ----------
     ds : xarray.Dataset
-        Input dataset containing spectral data
+        Dataset with one 'sowt_<OWT>' variable per optical water type.
     w_owt : dict
-        Dictionary containing weights for optical water types
-    min_wsum : float
-        Minimum weight sum threshold
-    max_wsum : float
-        Maximum weight sum threshold
+        Weight of each OWT, keyed by the 'sowt_<OWT>' variable names.
+    min_wsum, max_wsum : float
+        Wsum values mapped to COI = 0 and COI = 1 (COI is clipped to [0, 1]).
     exp : float, optional
-        Exponent used in computation, by default 1.0
-        
+        Exponent used in the fractionality term, by default 1.0.
+
     Returns
     -------
     xarray.Dataset
-        Input dataset with added 'wsum' and 'coi' variables
+        The input dataset with 'wsum' and 'coi' added.
     """
-    try:
-        # Get sowt variables
-        sowt_vars = [var for var in ds.data_vars if var.startswith('sowt_')]
-    
-        # Create combined DataArray
-        combined = xarray.concat([ds[var] for var in sowt_vars], dim='sowt')
-        combined = combined.assign_coords(sowt=sowt_vars)
-    
-        # Create mask for valid data
-        valid_mask = ~numpy.isnan(combined).any(dim='sowt')
-        
-        # Calculate fractionality
-        powered = combined ** exp
-        total_powered = powered.sum(dim='sowt')
-        fractions = xarray.where(valid_mask, powered / total_powered, numpy.nan)
-        
-        # Prepare weights
-        weights = xarray.DataArray(
-            [w_owt[var] for var in sowt_vars],
-            dims=['sowt'],
-            coords={'sowt': sowt_vars}
-        )
-        
-        # Calculate weighted sum and COI
-        weighted_sum = xarray.where(
-            valid_mask,
-            (combined * weights * fractions).sum(dim='sowt'),
-            numpy.nan
-        )
+    sowt_vars = [var for var in ds.data_vars if str(var).startswith('sowt_')]
+    if not sowt_vars:
+        raise ValueError("Dataset has no 'sowt_*' variables")
+    weights = owt_weights(sowt_vars, w_owt)
 
-        ds['wsum'] = weighted_sum
-        ds['coi'] = (ds['wsum'] - min_wsum) / (max_wsum - min_wsum)
-        
-        # Clip COI values to valid range
-        ds['coi'] = xarray.where(valid_mask, numpy.clip(ds['coi'], 0, 1), numpy.nan)
+    scores = xarray.concat([ds[var] for var in sowt_vars], dim='sowt')
+    wsum, coi = xarray.apply_ufunc(
+        wsum_and_coi, scores,
+        kwargs=dict(weights=weights, min_wsum=float(min_wsum), max_wsum=float(max_wsum), exp=float(exp)),
+        input_core_dims=[['sowt']], output_core_dims=[[], []],
+        dask='parallelized', output_dtypes=[float, float])
 
-        return ds
-
-    except Exception as e:
-        logger.error(f"Error in WSUM and COI calculation: {str(e)}")
-        raise
+    ds['wsum'] = wsum
+    ds['coi'] = coi
+    return ds
