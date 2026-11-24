@@ -8,6 +8,39 @@ Supported sensors: **OLCI**, **MERIS** and **MODIS**. You can also give your own
 
 You can use `coi` from the command line on netCDF files, or from Python on any `xarray.Dataset`. It processes pixels in blocks, so memory use stays low on large scenes. It also works with lazy, dask-backed datasets.
 
+> [!IMPORTANT]
+> The COI was developed with OLCI (Sentinel-3A/B) reflectance from the ESA Lake_cci v3 lake colour product, which is atmospherically corrected with **Polymer v4.17b**. The OWT library, the weights and the default Wsum range all come from that data. Reflectance from another atmospheric correction (or another sensor) may bias the COI, so use it with care.
+
+**Contents:** [Method](#method) · [Results from the paper](#results-from-the-paper) · [Installation](#installation) · [Input data](#input-data) · [Command line](#command-line) · [Python](#python) · [Custom weights and reference files](#custom-weights-and-reference-files) · [Tests](#tests) · [Citation](#citation)
+
+---
+
+## Method
+
+![Flowchart of the COI workflow: OLCI spectra from the ESA Lake_cci v3 product (Polymer v4.17b) are classified into optical water types; OWTs associated with cyanobacteria are split into sub-types to build a 25-OWT library; OWT membership scores are combined into a weighted sum (Wsum), which is rescaled into the COI.](docs/figures/coi_workflow.png)
+
+*How the OWT library, the OWT weights and the COI were derived. Figure from [Lomeo et al. (2025)](https://doi.org/10.1016/j.isprsjprs.2025.03.006), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).*
+
+The package ships the resulting 25-OWT library and weights, and applies the last two steps of the workflow. For each valid pixel, it does the following:
+
+1. **Standardise.** Divide the pixel spectrum, and each reference OWT spectrum, by its area (trapezoidal integral over wavelength).
+2. **Score.** Compute the spectral angle θ between the pixel and each OWT. The membership score is Sowt = 1 − θ/π, so 1 means an identical shape.
+3. **Fractionality.** Compute each OWT's share of the total score: Pᵢ = Sowtᵢ^exp / Σⱼ Sowtⱼ^exp. The paper uses exp = 1, which is the default.
+4. **Weighted sum.** Wsum = Σᵢ Sowtᵢ · wᵢ · Pᵢ, where wᵢ is the weight of OWT *i*.
+5. **Index.** COI = (Wsum − min_wsum) / (max_wsum − min_wsum), clipped to [0, 1].
+
+The default range (`min_wsum = 223`, `max_wsum = 321`) was derived for OLCI. For other sensors or band sets, you may want to set your own range.
+
+## Results from the paper
+
+![Histograms of COI, with the matching Wsum on the top axis, for oligotrophic, mesotrophic, eutrophic and hyper-eutrophic waters. Higher trophic states shift towards higher COI values.](docs/figures/coi_trophic_state_histogram.webp)
+
+*Distribution of COI (bottom axis) and the matching Wsum (top axis) by trophic state. Figure from [Lomeo et al. (2025)](https://doi.org/10.1016/j.isprsjprs.2025.03.006), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).*
+
+![Maps of Winam Gulf (23 March 2018) and Lake Erie (25 July 2019) comparing three algorithms from the literature (Maximum Peak Height, Mixture Density Network and Simis07, in mg m⁻³) with the COI (0 to 1).](docs/figures/coi_algorithm_comparison.webp)
+
+*COI compared with three algorithms from the literature (Maximum Peak Height, Mixture Density Network and Simis07) in Winam Gulf on 23 March 2018 and Lake Erie on 25 July 2019. Figure from [Lomeo et al. (2025)](https://doi.org/10.1016/j.isprsjprs.2025.03.006), [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).*
+
 ---
 
 ## Installation
@@ -234,20 +267,6 @@ The packaged files are in [`coi/core_files/`](coi/core_files): `OWT_inland_mean_
 
 ---
 
-## Method
-
-For each valid pixel:
-
-1. **Standardise.** Divide the pixel spectrum, and each reference OWT spectrum, by its area (trapezoidal integral over wavelength).
-2. **Score.** Compute the spectral angle θ between the pixel and each OWT. The membership score is Sowt = 1 − θ/π, so 1 means an identical shape.
-3. **Fractionality.** Compute each OWT's share of the total score: fᵢ = Sowtᵢ^exp / Σⱼ Sowtⱼ^exp.
-4. **Weighted sum.** Wsum = Σᵢ Sowtᵢ · wᵢ · fᵢ, where wᵢ is the weight of OWT *i*.
-5. **Index.** COI = (Wsum − min_wsum) / (max_wsum − min_wsum), clipped to [0, 1].
-
-The default range (`min_wsum = 223`, `max_wsum = 321`) was derived for OLCI. For other sensors or band sets, you may want to set your own range.
-
----
-
 ## Tests
 
 ```bash
@@ -282,4 +301,6 @@ If you use this package, please cite the paper that describes the method:
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+The code is released under the MIT license. See [LICENSE](LICENSE).
+
+The figures in [`docs/figures/`](docs/figures) are from Lomeo *et al.* (2025) and are licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
