@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper that describes the method."
+title: "coi: Cyanobacteria Occurrence Index"
+type: software
+authors:
+  - family-names: Lomeo
+    given-names: Davide
+version: 0.2.0
+license: MIT
+repository-code: "https://github.com/davidelomeo/coi"
+preferred-citation:
+  type: article
+  title: "A novel cyanobacteria occurrence index derived from optical water types in a tropical lake"
+  authors:
+    - family-names: Lomeo
+      given-names: Davide
+    - family-names: Simis
+      given-names: Stefan G. H.
+    - family-names: Liu
+      given-names: Xiaohan
+    - family-names: Selmes
+      given-names: Nick
+    - family-names: Warren
+      given-names: Mark A.
+    - family-names: Jungblut
+      given-names: Anne D.
+    - family-names: Tebbs
+      given-names: Emma J.
+  journal: "ISPRS Journal of Photogrammetry and Remote Sensing"
+  volume: 223
+  start: 58
+  end: 77
+  year: 2025
+  month: 5
+  doi: "10.1016/j.isprsjprs.2025.03.006"

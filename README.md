@@ -2,7 +2,7 @@
 
 `coi` computes the **Cyanobacteria Occurrence Index (COI)** from satellite water reflectance.
 
-Each pixel's spectrum is compared with a library of 25 reference Optical Water Types (OWTs) for inland waters. This gives one membership score (Sowt) per OWT. The scores are combined into a weighted sum (Wsum), and Wsum is rescaled to a 0–1 index (COI). By default, the package uses the extended 25-OWT library and the OWT weights from Lomeo *et al.* (in press).
+Each pixel's spectrum is compared with a library of 25 reference Optical Water Types (OWTs) for inland waters. This gives one membership score (Sowt) per OWT. The scores are combined into a weighted sum (Wsum), and Wsum is rescaled to a 0–1 index (COI). By default, the package uses the extended 25-OWT library and the OWT weights from [Lomeo *et al.* (2025)](https://doi.org/10.1016/j.isprsjprs.2025.03.006).
 
 Supported sensors: **OLCI**, **MERIS** and **MODIS**. You can also give your own list of bands.
 
@@ -264,9 +264,21 @@ The tests run automatically on GitHub Actions with Python 3.9 and 3.13.
 
 ## Citation
 
-If you use this package, please cite:
+If you use this package, please cite the paper that describes the method:
 
-> Lomeo *et al.* (in press).
+> Lomeo, D., Simis, S. G. H., Liu, X., Selmes, N., Warren, M. A., Jungblut, A. D., & Tebbs, E. J. (2025). A novel cyanobacteria occurrence index derived from optical water types in a tropical lake. *ISPRS Journal of Photogrammetry and Remote Sensing*, 223, 58–77. https://doi.org/10.1016/j.isprsjprs.2025.03.006
+
+```bibtex
+@article{lomeo2025coi,
+  title   = {A novel cyanobacteria occurrence index derived from optical water types in a tropical lake},
+  author  = {Lomeo, Davide and Simis, Stefan G. H. and Liu, Xiaohan and Selmes, Nick and Warren, Mark A. and Jungblut, Anne D. and Tebbs, Emma J.},
+  journal = {ISPRS Journal of Photogrammetry and Remote Sensing},
+  volume  = {223},
+  pages   = {58--77},
+  year    = {2025},
+  doi     = {10.1016/j.isprsjprs.2025.03.006}
+}
+```
 
 ## License
 
