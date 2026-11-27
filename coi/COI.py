@@ -3,7 +3,7 @@
 import json
 import logging
 from importlib.resources import files
-from typing import Dict, List, Optional
+from typing import ClassVar, NamedTuple
 
 import numpy
 import pandas
@@ -21,6 +21,28 @@ _BLOCK_SIZE = 262_144
 
 # Number of most similar OWTs reported for each pixel (dominant_owt_1, dominant_owt_2, ...)
 N_DOMINANT = 3
+
+
+class _Model(NamedTuple):
+    """Everything the calculation needs apart from the data, prepared once."""
+
+    sowt_names: list[str]
+    sort_idx: numpy.ndarray
+    sorted_wavelengths: numpy.ndarray
+    ref_standardised: numpy.ndarray  # (n_bands, n_owt)
+    weights: numpy.ndarray  # (n_owt,)
+    min_wsum: float
+    max_wsum: float
+    exp: float
+
+    @property
+    def n_dominant(self) -> int:
+        return min(N_DOMINANT, len(self.sowt_names))
+
+    @property
+    def name_lookup(self) -> numpy.ndarray:
+        """OWT names as in 'sowt_<name>'; the extra '' is looked up for pixels without a result."""
+        return numpy.array([name[len('sowt_'):] for name in self.sowt_names] + [''])
 
 
 class COI:
@@ -58,7 +80,7 @@ class COI:
     highest membership scores ('dominant_owt_1' to 'dominant_owt_3').
     """
 
-    SENSOR_BANDS = {
+    SENSOR_BANDS: ClassVar[dict[str, list[str]]] = {
         'OLCI': [
             'Rw412', 'Rw443', 'Rw490', 'Rw510', 'Rw560', 'Rw620',
             'Rw665', 'Rw674', 'Rw681', 'Rw709', 'Rw754', 'Rw779'
@@ -74,7 +96,7 @@ class COI:
     }
 
     # Reference (OLCI) band -> MODIS band; only MODIS bands within 6 nm of an OLCI band are used
-    MODIS_BAND_MAP = {
+    MODIS_BAND_MAP: ClassVar[dict[str, str]] = {
         'Rw412': 'Rw412',
         'Rw443': 'Rw443',
         'Rw490': 'Rw488',
@@ -87,14 +109,14 @@ class COI:
     def __init__(
         self,
         ds: xarray.Dataset,
-        sensor: Optional[str] = None,
-        bands: Optional[List[str]] = None,
-        w_owt: Optional[Dict] = None,
-        reference_owt: Optional[pandas.DataFrame] = None,
+        sensor: str | None = None,
+        bands: list[str] | None = None,
+        w_owt: dict | None = None,
+        reference_owt: pandas.DataFrame | None = None,
         min_wsum: float = 223.0,
         max_wsum: float = 321.0,
         exp: float = 1.0,
-        valid_mask: Optional[xarray.DataArray] = None,
+        valid_mask: xarray.DataArray | None = None,
         return_all: bool = False) -> None:
 
         self.ds = ds
@@ -121,7 +143,7 @@ class COI:
         logger.info(f"Initialised with sensor: {self.sensor or 'custom bands'}")
 
     @staticmethod
-    def _load_w_owt() -> Dict:
+    def _load_w_owt() -> dict:
         """Load the default OWT weights."""
         with (_CORE_FILES / 'w_owt.json').open('r') as f:
             return json.load(f)
@@ -132,7 +154,7 @@ class COI:
         with (_CORE_FILES / 'OWT_inland_mean_standardised_extended.csv').open('r') as f:
             return pandas.read_csv(f, index_col='wl')
 
-    def _get_sensor_bands(self) -> List[str]:
+    def _get_sensor_bands(self) -> list[str]:
         """Bands to use, from the sensor name or the custom band list."""
         if self.sensor is not None and self.custom_bands is not None:
             raise ValueError('Provide either a sensor or a custom bands list, not both')
@@ -146,7 +168,7 @@ class COI:
             return bands
         raise ValueError('Either sensor type or custom bands list must be provided')
 
-    def _band_variables(self) -> List[str]:
+    def _band_variables(self) -> list[str]:
         """Names of the band variables in the input dataset ('Rw443' or 'Rw443_mean')."""
         if all(band in self.ds for band in self.bands):
             return self.bands
@@ -157,13 +179,19 @@ class COI:
         missing = [band for band in self.bands if band not in self.ds]
         raise KeyError(f"Input dataset is missing bands {missing} (also tried with a '_mean' suffix)")
 
-    def _sowt_names(self) -> List[str]:
+    def _sowt_names(self) -> list[str]:
         names = []
         for col in self.reference_owt.columns:
             if 'OWT_' not in str(col):
                 raise ValueError(f"Reference OWT columns must be named 'OWT_<name>'; got {col!r}")
             names.append(f"sowt_{str(col).split('OWT_')[1]}")
         return names
+
+    def _model(self) -> _Model:
+        sowt_names = self._sowt_names()
+        sort_idx, sorted_wavelengths, ref_standardised = prepare_reference(self.bands, self.reference_owt)
+        return _Model(sowt_names, sort_idx, sorted_wavelengths, ref_standardised,
+                      owt_weights(sowt_names, self.w_owt), self.min_wsum, self.max_wsum, self.exp)
 
     def process_spectral_data(self) -> xarray.Dataset:
         """Compute Wsum and COI for every pixel.
@@ -177,12 +205,8 @@ class COI:
             the highest Sowt, '' where there is no result). With ``return_all=True`` also
             the input 'Rw*' bands and the 'sowt_*' scores.
         """
-        sowt_names = self._sowt_names()
-        sort_idx, sorted_wavelengths, ref_standardised = prepare_reference(self.bands, self.reference_owt)
-
-        n_dominant = min(N_DOMINANT, len(sowt_names))
-        # OWT names as in 'sowt_<name>'; the extra '' is looked up for pixels without a result
-        name_lookup = numpy.array([name[len('sowt_'):] for name in sowt_names] + [''])
+        model = self._model()
+        sowt_names, n_dominant = model.sowt_names, model.n_dominant
 
         inputs = [self.ds[name] for name in self._band_variables()]
         if self.valid_mask is not None:
@@ -190,22 +214,14 @@ class COI:
 
         # Outputs: wsum, coi, one array per dominant OWT rank and, with return_all, all scores
         output_core_dims = [[]] * (2 + n_dominant) + ([['owt']] if self.return_all else [])
-        output_dtypes = [float, float] + [name_lookup.dtype] * n_dominant + ([float] if self.return_all else [])
+        output_dtypes = [float, float] + [model.name_lookup.dtype] * n_dominant
+        if self.return_all:
+            output_dtypes.append(float)
         logger.info('Computing spectral angle, Wsum and COI')
         outputs = xarray.apply_ufunc(
             _coi_kernel, *inputs,
-            kwargs=dict(
-                has_mask=self.valid_mask is not None,
-                sort_idx=sort_idx,
-                sorted_wavelengths=sorted_wavelengths,
-                ref_standardised=ref_standardised,
-                weights=owt_weights(sowt_names, self.w_owt),
-                min_wsum=self.min_wsum,
-                max_wsum=self.max_wsum,
-                exp=self.exp,
-                name_lookup=name_lookup,
-                n_dominant=n_dominant,
-                return_scores=self.return_all),
+            kwargs={'has_mask': self.valid_mask is not None, 'model': model,
+                    'return_scores': self.return_all},
             input_core_dims=[[] for _ in inputs],
             output_core_dims=output_core_dims,
             dask='parallelized',
@@ -240,13 +256,45 @@ class COI:
 _ORDINALS = ['1st', '2nd', '3rd'] + [f'{n}th' for n in range(4, 21)]
 
 
-def _coi_kernel(*arrays, has_mask, sort_idx, sorted_wavelengths, ref_standardised, weights,
-                min_wsum, max_wsum, exp, name_lookup, n_dominant, return_scores):
-    """Wsum, COI, dominant OWT names (and optionally all scores) for numpy band arrays of any shape.
+def _process(read_block, n_pixels: int, mask: numpy.ndarray | None, model: _Model,
+             return_scores: bool):
+    """Wsum, COI, dominant OWTs and optionally all scores for ``n_pixels`` spectra.
 
+    ``read_block(slice)`` returns those spectra as (n, n_bands), in the order of the bands.
     Only pixels with finite values in every band (and inside the mask) are computed; the
     rest are NaN. Pixels are processed in blocks to keep memory use bounded.
+
+    Returns wsum and coi (n_pixels,), the columns of the dominant OWTs (n_pixels, n_dominant),
+    -1 where there is no result, and the scores (n_pixels, n_owt) or None.
     """
+    wsum = numpy.full(n_pixels, numpy.nan)
+    coi = numpy.full(n_pixels, numpy.nan)
+    dominant = numpy.full((n_pixels, model.n_dominant), -1, dtype=numpy.int16)
+    scores = numpy.full((n_pixels, len(model.sowt_names)), numpy.nan) if return_scores else None
+
+    for start in range(0, n_pixels, _BLOCK_SIZE):
+        block = slice(start, min(start + _BLOCK_SIZE, n_pixels))
+        spectra = numpy.asarray(read_block(block), dtype=float)
+        valid = numpy.isfinite(spectra).all(axis=1)
+        if mask is not None:
+            valid &= mask[block]
+        if not valid.any():
+            continue
+
+        index = start + numpy.flatnonzero(valid)
+        block_scores = spectral_scores(
+            spectra[valid], model.sort_idx, model.sorted_wavelengths, model.ref_standardised)
+        wsum[index], coi[index] = wsum_and_coi(
+            block_scores, model.weights, model.min_wsum, model.max_wsum, model.exp)
+        dominant[index] = _top_columns(block_scores, model.n_dominant).T
+        if return_scores:
+            scores[index] = block_scores
+
+    return wsum, coi, dominant, scores
+
+
+def _coi_kernel(*arrays, has_mask: bool, model: _Model, return_scores: bool):
+    """``_process`` for one numpy array per band, of any shape (used by xarray.apply_ufunc)."""
     arrays = numpy.broadcast_arrays(*arrays)
     if has_mask:
         *bands, mask = arrays
@@ -256,33 +304,14 @@ def _coi_kernel(*arrays, has_mask, sort_idx, sorted_wavelengths, ref_standardise
 
     shape = bands[0].shape
     flat_bands = [band.reshape(-1) for band in bands]
-    n_pixels, n_owt = flat_bands[0].size, ref_standardised.shape[1]
-
-    wsum = numpy.full(n_pixels, numpy.nan)
-    coi = numpy.full(n_pixels, numpy.nan)
-    dominant = numpy.full((n_dominant, n_pixels), -1, dtype=numpy.int16)  # -1 -> ''
-    scores = numpy.full((n_pixels, n_owt), numpy.nan) if return_scores else None
-
-    for start in range(0, n_pixels, _BLOCK_SIZE):
-        block = slice(start, min(start + _BLOCK_SIZE, n_pixels))
-        spectra = numpy.stack([band[block] for band in flat_bands], axis=1)
-        valid = numpy.isfinite(spectra).all(axis=1)
-        if flat_mask is not None:
-            valid &= flat_mask[block]
-        if not valid.any():
-            continue
-
-        index = start + numpy.flatnonzero(valid)
-        block_scores = spectral_scores(spectra[valid], sort_idx, sorted_wavelengths, ref_standardised)
-        wsum[index], coi[index] = wsum_and_coi(block_scores, weights, min_wsum, max_wsum, exp)
-        dominant[:, index] = _top_columns(block_scores, n_dominant)
-        if return_scores:
-            scores[index] = block_scores
+    wsum, coi, dominant, scores = _process(
+        lambda block: numpy.stack([band[block] for band in flat_bands], axis=1),
+        flat_bands[0].size, flat_mask, model, return_scores)
 
     outputs = (wsum.reshape(shape), coi.reshape(shape))
-    outputs += tuple(name_lookup[codes].reshape(shape) for codes in dominant)
+    outputs += tuple(model.name_lookup[codes].reshape(shape) for codes in dominant.T)
     if return_scores:
-        outputs += (scores.reshape(shape + (n_owt,)),)
+        outputs += (scores.reshape((*shape, len(model.sowt_names))),)
     return outputs
 
 

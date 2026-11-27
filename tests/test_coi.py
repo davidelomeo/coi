@@ -1,16 +1,20 @@
 import importlib
 import json
+import subprocess
+import sys
+import warnings
 from importlib.resources import files
+from pathlib import Path
 
+import netCDF4
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 
 import coi
-from coi import COI, calculate_wsum_and_coi, compute_spectral_angle
+from coi import COI, CoiArrays, calculate_wsum_and_coi, compute_coi, compute_spectral_angle
 from coi.cli import main
-from coi.compute_spectral_angle import _trapezoid
 
 # The module, not the COI class that the package exports under the same name
 coi_module = importlib.import_module('coi.COI')
@@ -48,11 +52,11 @@ def slow_scores(spectrum, bands, reference):
     wl = np.array([float(b[2:]) for b in bands])
     order = np.argsort(wl)
     x = np.asarray(spectrum, dtype=float)
-    x = x / _trapezoid(x[order], wl[order])
+    x = x / np.trapezoid(x[order], wl[order])
     scores = []
     for col in reference.columns:
         r = reference.loc[bands, col].values
-        r = r / _trapezoid(r[order], wl[order])
+        r = r / np.trapezoid(r[order], wl[order])
         cos = np.dot(x, r) / (np.linalg.norm(x) * np.linalg.norm(r))
         scores.append(1 - np.arccos(np.clip(cos, -1, 1)) / np.pi)
     return np.array(scores)
@@ -82,7 +86,7 @@ def test_matches_plain_implementation(ds, kwargs):
 
 def test_output_structure(ds):
     out = COI(ds, sensor='OLCI').process_spectral_data()
-    assert list(out.data_vars) == ['wsum', 'coi'] + DOMINANT
+    assert list(out.data_vars) == ['wsum', 'coi', *DOMINANT]
     assert all(out[v].dims == ('y', 'x') for v in out.data_vars)
     np.testing.assert_array_equal(out['y'], ds['y'])
     valid = out['coi'].values[~np.isnan(out['coi'].values)]
@@ -107,7 +111,7 @@ def test_return_all_contents(ds):
     sowt = [v for v in out.data_vars if v.startswith('sowt_')]
     assert len(sowt) == REFERENCE.shape[1]
     assert set(OLCI) <= set(out.data_vars)
-    assert list(out.data_vars)[-5:] == ['wsum', 'coi'] + DOMINANT
+    assert list(out.data_vars)[-5:] == ['wsum', 'coi', *DOMINANT]
 
 
 def test_dominant_owts_are_the_highest_scores(ds):
@@ -140,7 +144,7 @@ def test_outputs_do_not_inherit_input_attributes(ds):
     ds['Rw412'].attrs['units'] = 'sr-1'
     out = COI(ds, sensor='OLCI', return_all=True).process_spectral_data()
     assert out['Rw412'].attrs == {'units': 'sr-1'}
-    for var in ['wsum', 'coi', 'sowt_5'] + DOMINANT:
+    for var in ['wsum', 'coi', 'sowt_5', *DOMINANT]:
         assert 'units' not in out[var].attrs
 
 
@@ -238,7 +242,8 @@ def test_dask_is_lazy_and_matches(ds):
     pytest.importorskip('dask')
     lazy = COI(ds.chunk({'y': 5, 'x': 6}), sensor='OLCI', return_all=True).process_spectral_data()
     assert lazy['coi'].chunks is not None
-    xr.testing.assert_allclose(lazy.compute(), COI(ds, sensor='OLCI', return_all=True).process_spectral_data())
+    expected = COI(ds, sensor='OLCI', return_all=True).process_spectral_data()
+    xr.testing.assert_allclose(lazy.compute(), expected)
 
 
 def test_version():
@@ -250,9 +255,10 @@ def test_cli(ds, tmp_path):
     ds.to_netcdf(src)
     expected = COI(ds, sensor='OLCI', exp=2.0, min_wsum=200.0, max_wsum=300.0).process_spectral_data()
 
-    main(['-i', str(src), '-o', str(tmp_path / 'a.nc'), '-s', 'olci', '--exp', '2', '--min-wsum', '200', '--max-wsum', '300'])
+    main(['-i', str(src), '-o', str(tmp_path / 'a.nc'), '-s', 'olci',
+          '--exp', '2', '--min-wsum', '200', '--max-wsum', '300'])
     with xr.open_dataset(tmp_path / 'a.nc') as out:
-        assert list(out.data_vars) == ['wsum', 'coi'] + DOMINANT
+        assert list(out.data_vars) == ['wsum', 'coi', *DOMINANT]
         np.testing.assert_allclose(out['coi'], expected['coi'])
         for var in DOMINANT:
             np.testing.assert_array_equal(out[var].values.astype(str), expected[var].values)
@@ -284,3 +290,395 @@ def test_cli_text_conversion_round_trips(tmp_path):
     with xr.open_dataset(tmp_path / 't.nc') as back:
         for var in ds.data_vars:
             np.testing.assert_array_equal(back[var].values.astype(str), ds[var].values)
+
+
+OLCI_WL = np.array([float(band[2:]) for band in OLCI])
+
+
+def cube_of(scene, bands=OLCI):
+    """The scene as one array with wavelength as the last axis, shape (y, x, band)."""
+    return np.stack([scene[band].values for band in bands], axis=-1)
+
+
+def spectral_dataarray(scene, dim='wavelength'):
+    return xr.DataArray(cube_of(scene), dims=('y', 'x', dim),
+                        coords={'y': scene['y'], 'x': scene['x'], dim: OLCI_WL}, name='rrs')
+
+
+def assert_matches_class(result, expected):
+    np.testing.assert_allclose(result.wsum, expected['wsum'])
+    np.testing.assert_allclose(result.coi, expected['coi'])
+    for rank, name in enumerate(DOMINANT):
+        np.testing.assert_array_equal(result.dominant_owt[..., rank], expected[name].values)
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'exp': 2.0, 'min_wsum': 200.0, 'max_wsum': 300.0}])
+def test_numpy_input_matches_class(ds, kwargs):
+    result = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI', **kwargs)
+    assert isinstance(result, CoiArrays) and result.scores is None
+    assert result.wsum.shape == result.coi.shape == (12, 15)
+    assert result.dominant_owt.shape == (12, 15, 3)
+    assert_matches_class(result, COI(ds, sensor='OLCI', **kwargs).process_spectral_data())
+
+
+def test_numpy_single_spectrum_and_empty_input(ds):
+    wsum, coi_value, dominant, _ = compute_coi(cube_of(ds)[5, 7], OLCI_WL, sensor='olci')
+    expected, _ = slow_reference(spectrum_at(ds, OLCI, 5, 7), OLCI, REFERENCE, WEIGHTS)
+    assert wsum.shape == coi_value.shape == () and dominant.shape == (3,)
+    assert float(wsum) == pytest.approx(expected, rel=1e-6)
+    empty = compute_coi(np.empty((0, len(OLCI))), OLCI_WL, sensor='OLCI')
+    assert empty.coi.shape == (0,) and empty.dominant_owt.shape == (0, 3)
+
+
+def test_numpy_bands_are_found_by_wavelength(ds):
+    # Any order, extra bands, and a centre such as 682 nm for the Rw681 band
+    wavelengths = np.concatenate([[400.0], np.where(OLCI_WL == 681, 682, OLCI_WL), [865.0]])
+    cube = cube_of(ds)
+    padded = np.concatenate([cube[..., :1] * 3, cube, cube[..., -1:] * 3], axis=-1)
+    order = np.random.default_rng(1).permutation(wavelengths.size)
+    result = compute_coi(padded[..., order], wavelengths[order], sensor='OLCI')
+    assert_matches_class(result, COI(ds, sensor='OLCI').process_spectral_data())
+
+
+def test_numpy_custom_bands_and_modis(ds):
+    bands = ['Rw443', 'Rw490', 'Rw560', 'Rw665', 'Rw681']
+    result = compute_coi(cube_of(ds), OLCI_WL, bands=bands)
+    assert_matches_class(result, COI(ds, bands=bands).process_spectral_data())
+    modis_ds = ds.rename(MODIS_RENAME)
+    modis = COI.SENSOR_BANDS['MODIS']
+    result = compute_coi(cube_of(modis_ds, modis), [float(b[2:]) for b in modis], sensor='MODIS')
+    assert_matches_class(result, COI(modis_ds, sensor='MODIS').process_spectral_data())
+
+
+def test_numpy_scores_mask_and_blocks(ds, monkeypatch):
+    mask = np.arange(15) != 4  # broadcast over y
+    expected = COI(ds, sensor='OLCI', return_all=True,
+                   valid_mask=xr.DataArray(mask, dims='x')).process_spectral_data()
+    monkeypatch.setattr(coi_module, '_BLOCK_SIZE', 7)
+    result = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI', valid_mask=mask, return_scores=True)
+    assert result.scores.shape == (12, 15, REFERENCE.shape[1])
+    assert_matches_class(result, expected)
+    np.testing.assert_allclose(result.scores[..., 0], expected['sowt_1.2'])
+    assert np.isnan(result.coi[:, 4]).all()
+
+
+def test_numpy_masked_values_are_missing(ds):
+    cube = np.ma.masked_array(cube_of(ds))
+    cube[5, 5, 3] = np.ma.masked
+    result = compute_coi(cube, OLCI_WL, sensor='OLCI')
+    assert np.isnan(result.coi[5, 5]) and (result.dominant_owt[5, 5] == '').all()
+    assert np.isfinite(result.coi[5, 6])
+
+
+def test_dataarray_input(ds):
+    expected = COI(ds, sensor='OLCI').process_spectral_data()
+    xr.testing.assert_allclose(compute_coi(spectral_dataarray(ds), sensor='OLCI'), expected)
+    # Wavelength first, and a dimension name that has to be given
+    named = spectral_dataarray(ds, 'z').transpose('z', 'y', 'x')
+    xr.testing.assert_allclose(compute_coi(named, sensor='OLCI', dim='z'), expected)
+    with pytest.raises(ValueError, match='pass dim'):
+        compute_coi(named, sensor='OLCI')
+    # Wavelengths in a separate coordinate of a band dimension
+    banded = spectral_dataarray(ds, 'band').assign_coords(
+        band=np.arange(len(OLCI)), wavelength=('band', OLCI_WL))
+    xr.testing.assert_allclose(compute_coi(banded, sensor='OLCI'), expected)
+    unlabelled = named.drop_vars('z')
+    with pytest.raises(ValueError, match='no wavelength coordinate'):
+        compute_coi(unlabelled, sensor='OLCI', dim='z')
+    xr.testing.assert_allclose(
+        compute_coi(unlabelled, OLCI_WL, sensor='OLCI', dim='z'), expected)
+
+
+def test_dataarray_scores(ds):
+    result = compute_coi(spectral_dataarray(ds), sensor='OLCI', return_scores=True)
+    assert 'sowt_5' in result and not set(OLCI) & set(result.data_vars)
+
+
+def test_dataarray_with_dask_is_lazy(ds):
+    pytest.importorskip('dask')
+    data = spectral_dataarray(ds)
+    lazy = compute_coi(data.chunk({'y': 5, 'wavelength': 4}), sensor='OLCI')
+    assert lazy['coi'].chunks is not None
+    xr.testing.assert_allclose(lazy.compute(), compute_coi(data, sensor='OLCI'))
+
+
+@pytest.mark.parametrize('columns', [OLCI_WL, OLCI_WL.astype(int).astype(str), OLCI])
+def test_dataframe_input(ds, columns):
+    cube = cube_of(ds)[1:3].reshape(-1, len(OLCI))
+    frame = pd.DataFrame(cube, columns=columns, index=[f'obs{i}' for i in range(len(cube))])
+    out = compute_coi(frame, sensor='OLCI')
+    assert list(out.columns) == ['wsum', 'coi', *DOMINANT]
+    pd.testing.assert_index_equal(out.index, frame.index)
+    expected = COI(ds, sensor='OLCI').process_spectral_data().isel(y=slice(1, 3))
+    np.testing.assert_allclose(out['coi'], expected['coi'].values.ravel())
+    np.testing.assert_array_equal(out['dominant_owt_1'], expected['dominant_owt_1'].values.ravel())
+    scored = compute_coi(frame, sensor='OLCI', return_scores=True)
+    assert scored.shape[1] == 5 + REFERENCE.shape[1] and 'sowt_5' in scored
+
+
+def test_compute_coi_errors(ds):
+    cube = cube_of(ds)
+    with pytest.raises(ValueError, match='Pass wavelengths'):
+        compute_coi(cube, sensor='OLCI')
+    with pytest.raises(ValueError, match='last axis'):
+        compute_coi(cube.swapaxes(1, 2), OLCI_WL, sensor='OLCI')
+    with pytest.raises(ValueError, match='only applies to xarray'):
+        compute_coi(cube, OLCI_WL, sensor='OLCI', dim='wavelength')
+    with pytest.raises(TypeError, match='process_spectral_data'):
+        compute_coi(ds, sensor='OLCI')
+    with pytest.raises(KeyError, match=r"missing bands \['Rw412'\]"):
+        compute_coi(cube[..., 1:], OLCI_WL[1:], sensor='OLCI')
+    with pytest.raises(ValueError, match='same input wavelength'):
+        compute_coi(cube[..., :2], [412.0, 677.0], bands=['Rw674', 'Rw681'], tolerance=5)
+    with pytest.raises(ValueError, match='finite'):
+        compute_coi(cube, np.where(OLCI_WL == 443, np.nan, OLCI_WL), sensor='OLCI')
+    with pytest.raises(ValueError, match='Either sensor'):
+        compute_coi(cube, OLCI_WL)
+
+
+def test_hyperspectral_input_warns(ds):
+    wavelengths = np.arange(400.0, 801.0)
+    spectrum = np.interp(wavelengths, OLCI_WL, cube_of(ds)[5, 5])
+    with pytest.warns(UserWarning, match='looks hyperspectral'):
+        compute_coi(spectrum, wavelengths, sensor='OLCI')
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI')
+
+
+@pytest.fixture
+def spectral_file(ds, tmp_path):
+    """A file laid out like satconv output: one spectral variable plus per-observation data."""
+    scene = xr.Dataset(
+        {'rrs': spectral_dataarray(ds), 'quality': (('y', 'x'), np.ones((12, 15), dtype=np.int8)),
+         'station': ('y', [f'station {i}' for i in range(12)])},
+        attrs={'history': 'created'})
+    path = tmp_path / 'spectra.nc'
+    scene.to_netcdf(path)
+    return path
+
+
+@pytest.mark.parametrize('extra', [[], ['--variable', 'rrs'], ['--dim', 'wavelength']])
+def test_cli_wavelength_variable(ds, spectral_file, tmp_path, extra):
+    out = tmp_path / 'coi.nc'
+    main(['-i', str(spectral_file), '-o', str(out), '-s', 'OLCI',
+          '--keep', 'quality', 'station', 'y', *extra])
+    with xr.open_dataset(out) as result:
+        expected = COI(ds, sensor='OLCI').process_spectral_data()
+        assert list(result.data_vars) == ['wsum', 'coi', *DOMINANT, 'quality', 'station']
+        np.testing.assert_allclose(result['coi'], expected['coi'])
+        assert result['quality'].dtype == np.int8
+        assert str(result['station'].values[3]) == 'station 3'
+        assert result.attrs['history'].startswith('created\n')
+        assert result.attrs['processing_date'].endswith('+00:00')
+
+
+def test_cli_return_all_from_wavelength_variable(spectral_file, tmp_path):
+    out = tmp_path / 'all.nc'
+    main(['-i', str(spectral_file), '-o', str(out), '-s', 'OLCI', '--return-all'])
+    with xr.open_dataset(out) as result:
+        assert set(OLCI) <= set(result.data_vars) and 'sowt_5' in result
+
+
+@pytest.mark.parametrize('extra, message', [
+    (['--variable', 'nope'], 'No variable nope'),
+    (['--variable', 'quality'], 'Cannot tell which'),
+    (['--dim', 'nope'], "No variable has a dimension 'nope'"),
+    (['--keep', 'nope'], '--keep: no variable nope'),
+])
+def test_cli_wavelength_errors(spectral_file, tmp_path, caplog, extra, message):
+    with pytest.raises(SystemExit) as exc:
+        main(['-i', str(spectral_file), '-o', str(tmp_path / 'x.nc'), '-s', 'OLCI', *extra])
+    assert exc.value.code == 1 and message in caplog.text
+    assert not (tmp_path / 'x.nc').exists()
+
+
+def test_cli_asks_which_variable(ds, tmp_path, caplog):
+    src = tmp_path / 'two.nc'
+    xr.Dataset({'rrs': spectral_dataarray(ds), 'other': spectral_dataarray(ds)}).to_netcdf(src)
+    with pytest.raises(SystemExit):
+        main(['-i', str(src), '-o', str(tmp_path / 'x.nc'), '-s', 'OLCI'])
+    assert 'choose with --variable: rrs, other' in caplog.text
+
+
+def test_cli_does_not_overwrite_input(spectral_file, caplog):
+    before = spectral_file.read_bytes()
+    with pytest.raises(SystemExit):
+        main(['-i', str(spectral_file), '-o', str(spectral_file), '-s', 'OLCI'])
+    assert 'must not be the input' in caplog.text and spectral_file.read_bytes() == before
+
+
+def test_module_can_be_run():
+    done = subprocess.run([sys.executable, '-m', 'coi', '--version'],
+                          capture_output=True, text=True, check=True)
+    assert done.stdout == f'coi {coi.__version__}\n'
+
+
+def write_variable(nc, name, kind, dims, values, **attrs):
+    fill = attrs.pop('_FillValue', None)
+    variable = nc.createVariable(name, kind, dims, fill_value=fill)
+    variable.set_auto_maskandscale(False)
+    variable.set_auto_chartostring(False)
+    variable.setncatts(attrs)
+    variable[...] = values
+
+
+def stored_contents(path):
+    """Every variable of a netCDF file as it is stored: type, dimensions, attributes, values."""
+    contents = {}
+    with netCDF4.Dataset(path) as nc:
+        for name, variable in nc.variables.items():
+            variable.set_auto_maskandscale(False)
+            variable.set_auto_chartostring(False)
+            data = np.asarray(variable[...])
+            values = data.tolist() if data.dtype.kind in 'OSU' else data.tobytes()
+            attrs = {key: repr(variable.getncattr(key)) for key in variable.ncattrs()}
+            contents[name] = (str(variable.dtype), variable.dimensions, attrs, values)
+    return contents
+
+
+@pytest.fixture
+def awkward(ds, tmp_path):
+    """Spectra plus variables stored in ways that decoding and re-encoding can change."""
+    path = tmp_path / 'awkward.nc'
+    spectra = cube_of(ds)[1:5, 0]
+    with netCDF4.Dataset(path, 'w') as nc:
+        nc.createDimension('time', 4)
+        nc.createDimension('wavelength', len(OLCI))
+        nc.createDimension('length', 3)
+        write_variable(nc, 'time', 'f8', ('time',), np.arange(4.0),
+                       units='seconds since 2020-01-01', calendar='standard')
+        write_variable(nc, 'wavelength', 'f8', ('wavelength',), OLCI_WL)
+        write_variable(nc, 'rrs', 'f8', ('time', 'wavelength'), spectra, coordinates='lat')
+        write_variable(nc, 'lat', 'f4', ('time',), np.arange(4, dtype='f4'))
+        write_variable(nc, 'sst', 'i2', ('time',), np.array([40, -1, -32768, -2], 'i2'),
+                       _Unsigned='true', scale_factor=np.float32(0.5), _FillValue=np.int16(-2))
+        write_variable(nc, 'flags', 'i4', ('time',), np.array([0, -1, -2147483648, 7], 'i4'),
+                       _Unsigned='true')
+        write_variable(nc, 'two_fills', 'f4', ('time',), np.array([1, -9, 3, -8], 'f4'),
+                       _FillValue=np.float32(-9), missing_value=np.float32(-8))
+        write_variable(nc, 'no_fill', 'f4', ('time',), np.array([1, 2, 3, np.nan], 'f4'))
+        write_variable(nc, 'boolean', 'i1', ('time',), np.array([1, 0, 1, 1], 'i1'),
+                       **{'dtype': 'bool'})
+        write_variable(nc, 'text', str, ('time',), np.array(['a', 'bb', '', 'é'], object))
+        letters = netCDF4.stringtochar(np.array([b'x', b'yy', b'zzz', b''], 'S3'))
+        write_variable(nc, 'chars', 'S1', ('time', 'length'), letters, _Encoding='utf-8')
+        write_variable(nc, 'letter', 'S1', ('time',), np.array([b'a', b'b', b'', b'd'], 'S1'))
+        write_variable(nc, 'number', 'i4', (), 7, comment='scalar')
+        flag = nc.createEnumType('u1', 'flag_t', {'bad': 0, 'good': 1})
+        write_variable(nc, 'quality', flag, ('time',), np.array([0, 1, 1, 0], 'u1'))
+        pair = nc.createCompoundType(np.dtype([('a', 'f4'), ('b', 'i4')]), 'pair_t')
+        nc.createVariable('pair', pair, ('time',))[:] = np.array([(1, 2)] * 4, pair.dtype)
+        ragged = nc.createVariable('ragged', nc.createVLType('i4', 'ragged_t'), ('time',))
+        for i in range(4):
+            ragged[i] = np.arange(i + 1, dtype='i4')
+    return path
+
+
+def test_cli_keeps_variables_as_stored(awkward, tmp_path):
+    out = tmp_path / 'coi.nc'
+    names = ['sst', 'flags', 'two_fills', 'no_fill', 'boolean', 'text', 'chars', 'letter',
+             'number', 'quality', 'rrs']
+    main(['-i', str(awkward), '-o', str(out), '-s', 'OLCI', '--keep', *names])
+    before, after = stored_contents(awkward), stored_contents(out)
+    for name in [*names, 'lat', 'wavelength', 'time']:  # with the coordinates of the kept variables
+        stored_type, dims, attrs, values = after[name]
+        if 'coordinates' not in before[name][2]:
+            attrs.pop('coordinates', None)  # added to say which output coordinates apply
+        assert (stored_type, dims, attrs, values) == before[name], name
+    with xr.open_dataset(out) as result:
+        assert 'lat' in result.coords and np.isfinite(result['coi']).all()
+
+
+@pytest.mark.parametrize('name', ['pair', 'ragged'])
+def test_cli_reports_types_that_cannot_be_kept(awkward, tmp_path, caplog, name):
+    out = tmp_path / 'coi.nc'
+    out.write_bytes(b'earlier result')
+    with pytest.raises(SystemExit):
+        main(['-i', str(awkward), '-o', str(out), '-s', 'OLCI', '--keep', name])
+    assert f'{name} has a compound or variable-length type' in caplog.text
+    assert out.read_bytes() == b'earlier result'
+
+
+def test_cli_failed_write_leaves_the_old_output(spectral_file, tmp_path, caplog, monkeypatch):
+    def fail(self, path, *args, **kwargs):
+        Path(path).write_bytes(b'partial')
+        raise RuntimeError('NetCDF: HDF error')
+
+    monkeypatch.setattr(xr.Dataset, 'to_netcdf', fail)
+    out = tmp_path / 'coi.nc'
+    out.write_bytes(b'earlier result')
+    contents = sorted(tmp_path.iterdir())
+    with pytest.raises(SystemExit):
+        main(['-i', str(spectral_file), '-o', str(out), '-s', 'OLCI'])
+    assert 'HDF error' in caplog.text
+    assert out.read_bytes() == b'earlier result' and sorted(tmp_path.iterdir()) == contents
+
+
+def test_cli_home_folder_paths(spectral_file, tmp_path, caplog, monkeypatch):
+    elsewhere = tmp_path / 'elsewhere'
+    elsewhere.mkdir()
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.chdir(elsewhere)
+    before = spectral_file.read_bytes()
+    # A shell leaves '~' in --option=~/file for the program to expand
+    same = [f'--input=~/{spectral_file.name}', f'--output=~/{spectral_file.name}', '-s', 'OLCI']
+    with pytest.raises(SystemExit):
+        main(same)
+    assert 'must not be the input' in caplog.text and spectral_file.read_bytes() == before
+    for _ in range(2):  # the second run replaces the output of the first
+        main([f'--input=~/{spectral_file.name}', '--output=~/coi.nc', '-s', 'OLCI'])
+    assert (tmp_path / 'coi.nc').exists() and not list(elsewhere.iterdir())
+
+
+def test_cli_rw_prefix_alone_is_not_a_band(ds, tmp_path):
+    src, out = tmp_path / 'in.nc', tmp_path / 'out.nc'
+    xr.Dataset({'Rw': spectral_dataarray(ds), 'Rw_QC': ('y', np.ones(12))}).to_netcdf(src)
+    main(['-i', str(src), '-o', str(out), '-s', 'OLCI'])
+    with xr.open_dataset(out) as result:
+        np.testing.assert_allclose(result['coi'], COI(ds, sensor='OLCI').process_spectral_data()['coi'])
+
+
+def test_cli_wavelengths_in_a_data_variable(ds, tmp_path):
+    src, out = tmp_path / 'in.nc', tmp_path / 'out.nc'
+    xr.Dataset({'rrs': (('y', 'x', 'band'), cube_of(ds)),
+                'wavelength': ('band', OLCI_WL)}).to_netcdf(src)
+    main(['-i', str(src), '-o', str(out), '-s', 'OLCI'])
+    with xr.open_dataset(out) as result:
+        np.testing.assert_allclose(result['coi'], COI(ds, sensor='OLCI').process_spectral_data()['coi'])
+
+
+@pytest.mark.parametrize('dim', ['wavelength', 'band'])
+def test_dataarray_with_coordinates_along_wavelength(ds, dim):
+    plain = spectral_dataarray(ds)
+    data = spectral_dataarray(ds, dim)
+    if dim == 'band':
+        data = data.assign_coords(wavelength=('band', OLCI_WL))
+    data = data.assign_coords(width=(('y', dim), np.ones((12, len(OLCI)))),
+                              label=(dim, [str(w) for w in OLCI_WL]))
+    result = compute_coi(data, sensor='OLCI')
+    xr.testing.assert_allclose(result, compute_coi(plain, sensor='OLCI'))
+
+
+@pytest.mark.parametrize('empty', [None, np.nan])
+def test_empty_custom_weight_counts_as_zero(ds, empty):
+    blank = {**WEIGHTS, 'sowt_5': empty}
+    zero = {**WEIGHTS, 'sowt_5': 0.0}
+    out = COI(ds, sensor='OLCI', w_owt=blank).process_spectral_data()
+    xr.testing.assert_identical(out, COI(ds, sensor='OLCI', w_owt=zero).process_spectral_data())
+    assert np.isfinite(out['coi']).any()
+
+
+@pytest.mark.parametrize('step, tolerance', [(2.5, 1.5), (3.0, 1.5), (5.0, 2.5), (10.0, 5.0)])
+def test_coarser_hyperspectral_input_warns(ds, step, tolerance):
+    wavelengths = np.arange(400.0, 801.0, step)
+    spectrum = np.interp(wavelengths, OLCI_WL, cube_of(ds)[5, 5])
+    with pytest.warns(UserWarning, match='looks hyperspectral'):
+        compute_coi(spectrum, wavelengths, sensor='OLCI', tolerance=tolerance)
+
+
+@pytest.mark.parametrize('step', [3.3, 5.0])
+def test_missing_bands_in_hyperspectral_input_give_a_hint(step):
+    wavelengths = np.arange(400.0, 801.0, step)
+    with pytest.raises(KeyError, match=r'looks hyperspectral.*satconv'):
+        compute_coi(np.ones(wavelengths.size), wavelengths, sensor='OLCI')
