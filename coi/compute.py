@@ -32,6 +32,7 @@ class CoiArrays(NamedTuple):
     dominant_owt: numpy.ndarray  # (..., 3) OWT names, most similar first; '' without a result
     scores: numpy.ndarray | None  # (..., n_owt) Sowt, only with return_scores=True
     coi_local: numpy.ndarray | None = None  # only with local_coi=True
+    wsum_local: numpy.ndarray | None = None  # only with local_coi=True; same values as wsum
 
 
 def compute_coi(
@@ -74,17 +75,18 @@ def compute_coi(
         Also return the membership score (Sowt) of every OWT.
     local_coi : bool
         Also return 'coi_local', the COI with the smallest and largest Wsum of ``spectra``
-        (after ``valid_mask``) as the boundaries. As for ``COI``.
+        (after ``valid_mask``) as the boundaries, and 'wsum_local'. As for ``COI``.
     tolerance : float
         Each band uses the input wavelength closest to it, which must be within this many nm.
 
     Returns
     -------
     CoiArrays, xarray.Dataset or pandas.DataFrame
-        * NumPy input: ``CoiArrays(wsum, coi, dominant_owt, scores, coi_local)``.
+        * NumPy input: ``CoiArrays(wsum, coi, dominant_owt, scores, coi_local, wsum_local)``.
         * DataArray input: Dataset like that of ``COI.process_spectral_data`` ('wsum', 'coi',
-          'dominant_owt_1' to '_3', plus 'sowt_*' with ``return_scores`` and 'coi_local',
-          'wsum_local_min' and 'wsum_local_max' with ``local_coi``), lazy if dask-backed.
+          'dominant_owt_1' to '_3', plus 'sowt_*' with ``return_scores`` and 'wsum_local',
+          'coi_local', 'wsum_local_min' and 'wsum_local_max' with ``local_coi``), lazy if
+          dask-backed.
         * DataFrame input: the same names as columns, one row per observation.
     """
     if isinstance(spectra, xarray.Dataset):
@@ -145,13 +147,13 @@ def compute_coi(
         None if scores is None else scores.reshape((*shape, len(model.sowt_names))))
     if local_coi:
         own_range_coi, _, _ = coi_from_own_range(xarray.DataArray(result.wsum))
-        result = result._replace(coi_local=own_range_coi.values)
+        result = result._replace(coi_local=own_range_coi.values, wsum_local=result.wsum.copy())
     if not is_dataframe:
         return result
 
     columns_out = {'wsum': result.wsum, 'coi': result.coi}
     if local_coi:
-        columns_out['coi_local'] = result.coi_local
+        columns_out |= {'wsum_local': result.wsum_local, 'coi_local': result.coi_local}
     if return_scores:
         columns_out |= dict(zip(model.sowt_names, result.scores.T, strict=True))
     columns_out |= {f'dominant_owt_{rank + 1}': result.dominant_owt[:, rank]

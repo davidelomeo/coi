@@ -13,7 +13,14 @@ import pytest
 import xarray as xr
 
 import coi
-from coi import COI, CoiArrays, calculate_wsum_and_coi, compute_coi, compute_spectral_angle
+from coi import (
+    COI,
+    CoiArrays,
+    calculate_wsum_and_coi,
+    compute_coi,
+    compute_spectral_angle,
+    load_reference_owt,
+)
 from coi.cli import main
 
 # The module, not the COI class that the package exports under the same name
@@ -446,6 +453,22 @@ def test_hyperspectral_input_warns(ds):
         compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI')
 
 
+def test_load_reference_owt(ds):
+    table = load_reference_owt()
+    pd.testing.assert_frame_equal(table, REFERENCE)
+    assert list(table.index) == OLCI and table.index.name == 'wl' and table.shape == (12, 25)
+    # Changing one table does not affect the next, or the library COI uses
+    table.iloc[:, :] = 0.0
+    pd.testing.assert_frame_equal(load_reference_owt(), REFERENCE)
+    # It can be passed back, also as a subset of the water types
+    expected = COI(ds, sensor='OLCI').process_spectral_data()
+    given = COI(ds, sensor='OLCI', reference_owt=load_reference_owt()).process_spectral_data()
+    xr.testing.assert_identical(given, expected)
+    subset = load_reference_owt()[['OWT_2', 'OWT_3']]
+    result = COI(ds, sensor='OLCI', reference_owt=subset).process_spectral_data()
+    assert set(np.unique(result['dominant_owt_1'])) <= {'2', '3', ''}
+
+
 def own_range(wsum):
     return (wsum - np.nanmin(wsum)) / (np.nanmax(wsum) - np.nanmin(wsum))
 
@@ -454,8 +477,11 @@ def test_local_coi_dataset(ds):
     plain = COI(ds, sensor='OLCI').process_spectral_data()
     out = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
     assert list(plain.data_vars) == ['wsum', 'coi', *DOMINANT]
-    assert list(out.data_vars) == ['wsum', 'coi', 'coi_local', 'wsum_local_min', 'wsum_local_max', *DOMINANT]
+    added = ['wsum_local', 'coi_local', 'wsum_local_min', 'wsum_local_max']
+    assert list(out.data_vars) == ['wsum', 'coi', *added, *DOMINANT]
     xr.testing.assert_identical(out[list(plain.data_vars)], plain)  # the global COI is unchanged
+    np.testing.assert_array_equal(out['wsum_local'], plain['wsum'])
+    assert not np.shares_memory(out['wsum_local'].values, out['wsum'].values)
     wsum = plain['wsum'].values
     assert out['wsum_local_min'].ndim == 0 and out['wsum_local_min'] == np.nanmin(wsum)
     assert out['wsum_local_max'] == np.nanmax(wsum)
@@ -479,6 +505,7 @@ def test_local_coi_boundaries_skip_masked_pixels(ds):
     result = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI', valid_mask=mask.values, local_coi=True)
     kept = np.where(mask, wsum, np.nan)
     np.testing.assert_allclose(result.coi_local, own_range(kept))
+    np.testing.assert_allclose(result.wsum_local, kept)  # masked pixels are NaN here too
     assert np.nanmin(result.coi_local) == 0 and np.nanmax(result.coi_local) == 1
 
 
@@ -501,15 +528,19 @@ def test_local_coi_without_a_range_is_nan(ds, cube_slice):
 
 def test_local_coi_array_and_table_inputs(ds):
     expected = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
-    assert compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI').coi_local is None
+    plain = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI')
+    assert plain.coi_local is None and plain.wsum_local is None
     result = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI', local_coi=True)
     np.testing.assert_allclose(result.coi_local, expected['coi_local'])
+    np.testing.assert_allclose(result.wsum_local, expected['wsum_local'])
+    assert not np.shares_memory(result.wsum_local, result.wsum)
     xr.testing.assert_allclose(
         compute_coi(spectral_dataarray(ds), sensor='OLCI', local_coi=True), expected)
 
     frame = pd.DataFrame(cube_of(ds).reshape(-1, len(OLCI)), columns=OLCI_WL)
     table = compute_coi(frame, sensor='OLCI', local_coi=True)
-    assert list(table.columns) == ['wsum', 'coi', 'coi_local', *DOMINANT]
+    assert list(table.columns) == ['wsum', 'coi', 'wsum_local', 'coi_local', *DOMINANT]
+    np.testing.assert_array_equal(table['wsum_local'], table['wsum'])
     np.testing.assert_allclose(table['coi_local'], expected['coi_local'].values.ravel())
 
 
@@ -517,7 +548,7 @@ def test_local_coi_with_dask_uses_all_chunks_and_is_lazy(ds):
     pytest.importorskip('dask')
     data = spectral_dataarray(ds)
     lazy = compute_coi(data.chunk({'y': 5, 'x': 6}), sensor='OLCI', local_coi=True)
-    for name in ('coi_local', 'wsum_local_min', 'wsum_local_max'):
+    for name in ('wsum_local', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
         assert lazy[name].chunks is not None
     xr.testing.assert_allclose(lazy.compute(), compute_coi(data, sensor='OLCI', local_coi=True))
 
@@ -562,7 +593,7 @@ def test_cli_local_coi(ds, spectral_file, tmp_path):
     expected = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
     with xr.open_dataset(out) as result:
         assert list(result.data_vars) == list(expected.data_vars)
-        for name in ('coi', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
+        for name in ('coi', 'wsum_local', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
             np.testing.assert_allclose(result[name], expected[name])
 
 
@@ -597,7 +628,7 @@ def test_cli_valid_where(ds, flagged_file, tmp_path, options, keep):
     expected = COI(ds, sensor='OLCI', valid_mask=mask, local_coi=True).process_spectral_data()
     with xr.open_dataset(out) as result:
         assert result['coi'].dims == ('y', 'x')
-        for name in ('coi', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
+        for name in ('coi', 'wsum_local', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
             np.testing.assert_allclose(result[name], expected[name])
         assert np.isnan(result['coi'].values[~mask.values]).all()
 
