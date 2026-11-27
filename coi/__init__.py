@@ -7,13 +7,16 @@ try:
 except PackageNotFoundError:  # pragma: no cover - package not installed
     __version__ = 'unknown'
 
-from .COI import COI  # noqa: E402
-from .calculate_wsum_and_coi import calculate_wsum_and_coi  # noqa: E402
-from .compute_spectral_angle import compute_spectral_angle  # noqa: E402
+from .calculate_wsum_and_coi import calculate_wsum_and_coi
+from .COI import COI
+from .compute import CoiArrays, compute_coi
+from .compute_spectral_angle import compute_spectral_angle
 
 __all__ = [
     'COI',
-    'compute_spectral_angle',
-    'calculate_wsum_and_coi',
+    'CoiArrays',
     '__version__',
+    'calculate_wsum_and_coi',
+    'compute_coi',
+    'compute_spectral_angle',
 ]

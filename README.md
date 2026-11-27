@@ -6,12 +6,12 @@ Each pixel's spectrum is compared with a library of 25 reference Optical Water T
 
 Supported sensors: **OLCI**, **MERIS** and **MODIS**. You can also give your own list of bands.
 
-You can use `coi` from the command line on netCDF files, or from Python on any `xarray.Dataset`. It processes pixels in blocks, so memory use stays low on large scenes. It also works with lazy, dask-backed datasets.
+You can use `coi` from the command line on netCDF files, or from Python on xarray, NumPy or pandas data. It processes pixels in blocks, so memory use stays low on large scenes. It also works with lazy, dask-backed data.
 
 > [!IMPORTANT]
 > The COI was developed with OLCI (Sentinel-3A/B) reflectance from the ESA Lake_cci v3 lake colour product, which is atmospherically corrected with **Polymer v4.17b**. The OWT library, the weights and the default Wsum range all come from that data. Reflectance from another atmospheric correction (or another sensor) may bias the COI, so use it with care.
 
-**Contents:** [Method](#method) · [Results from the paper](#results-from-the-paper) · [Installation](#installation) · [Input data](#input-data) · [Output](#output) · [Command line](#command-line) · [Python](#python) · [Custom weights and reference files](#custom-weights-and-reference-files) · [Tests](#tests) · [Citation](#citation)
+**Contents:** [Method](#method) · [Results from the paper](#results-from-the-paper) · [Installation](#installation) · [Input data](#input-data) · [Output](#output) · [Command line](#command-line) · [Python](#python) · [Custom weights and reference files](#custom-weights-and-reference-files) · [Upgrading from 0.3](#upgrading-from-03) · [Tests](#tests) · [Citation](#citation)
 
 ---
 
@@ -45,11 +45,7 @@ The range is fixed: it is not taken from the Wsum values in your data, so COI va
 
 ## Installation
 
-`coi` needs Python 3.9 or newer. It installs numpy, pandas, xarray and netCDF4.
-
-> **The repository is private.** You need read access to `davidelomeo/coi` on GitHub, and git needs to be able to sign in. Use one of these:
-> - **HTTPS**: sign in once with the [GitHub CLI](https://cli.github.com/) (`gh auth login`, then `gh auth setup-git`). Then use the `https://` URLs below.
-> - **SSH**: if you have an SSH key on GitHub, replace `git+https://github.com/` with `git+ssh://git@github.com/` in the commands below.
+`coi` needs Python 3.11 or newer. It installs numpy, pandas, xarray and netCDF4.
 
 ### pip
 
@@ -113,9 +109,16 @@ coi --version
 
 ## Input data
 
-The input is an `xarray.Dataset` (or a netCDF file) with **one variable per band**, named `Rw<wavelength>`, for example `Rw443`. Names with a `_mean` suffix, such as `Rw443_mean`, are also accepted.
+`coi` reads reflectance at the sensor's bands in either of two layouts:
 
-- Band variables can have any dimensions (e.g. `(y, x)`, `(time, lat, lon)`), but they must all match.
+1. **One variable per band** in an `xarray.Dataset` or netCDF file, named `Rw<wavelength>`, for example `Rw443`. Names with a `_mean` suffix, such as `Rw443_mean`, are also accepted.
+2. **One array with a wavelength dimension**, such as the output of [satconv](https://github.com/davidelomeo/satconv): a netCDF variable, an `xarray.DataArray`, a NumPy array (wavelength on the last axis) or a pandas DataFrame (one row per observation, columns named `443` or `Rw443`).
+
+In the second layout, each band uses the input wavelength closest to it, which must be within 1.5 nm (so a 682 nm band centre serves as `Rw681`). Other wavelengths are ignored. The input is expected to be **band reflectance**: convolve hyperspectral spectra to the sensor's bands first. Input with more than 30 wavelengths, no more than 10 nm apart, is treated as hyperspectral and gives a warning (or, if bands are missing, an error that says so).
+
+In both layouts:
+
+- The data can have any number of dimensions (e.g. `(y, x)`, `(time, lat, lon)`). Band variables must all have the same ones.
 - The input can be on any scale, for example `Rw` or `Rrs`. Each spectrum is standardised by its area before it is compared with the reference spectra, so a constant scale factor does not change the result.
 - A pixel is returned as NaN if any of its bands is NaN or infinite, or if it falls outside the optional `valid_mask`.
 
@@ -139,14 +142,14 @@ Sensor names are case-insensitive. With **custom bands** (`bands=[...]` or `-b`)
 
 ## Output
 
-The output has the same coordinates as the input, and these variables:
+From the command line, `COI` and a DataArray, the output is an `xarray.Dataset` with the input's coordinates and these variables (NumPy and pandas input return the same values as [arrays or columns](#numpy-and-pandas)):
 
 | Variable | Description |
 |---|---|
 | `wsum` | Weighted sum of the OWT membership scores (Wsum) |
 | `coi` | Cyanobacteria Occurrence Index, between 0 and 1 |
 | `dominant_owt_1`, `dominant_owt_2`, `dominant_owt_3` | Names of the three OWTs with the highest membership scores (Sowt), from highest to lowest, for example `6.2` |
-| `sowt_<OWT>` | Membership score of each OWT, between 0 and 1 (only with `return_all` / `--return-all`) |
+| `sowt_<OWT>` | Membership score of each OWT, between 0 and 1 (only with `return_all` / `--return-all` / `return_scores`) |
 | `Rw*` | The input bands (only with `return_all` / `--return-all`) |
 
 Pixels without a result (see [Input data](#input-data)) are NaN in the numeric variables and empty text (`''`) in the `dominant_owt_*` variables. In netCDF files, the OWT names are stored as compact character arrays, and xarray reads them back as text.
@@ -159,12 +162,25 @@ Pixels without a result (see [Input data](#input-data)) are NaN in the numeric v
 coi -i input.nc -o output.nc -s OLCI
 ```
 
+The input file can have either [layout](#input-data). To go from hyperspectral spectra to COI in two steps:
+
+```bash
+satconv -i spectra.nc -o olci.nc -s OLCI_S3A -v rrs --range 412 779
+```
+
+```bash
+coi -i olci.nc -o coi.nc -s OLCI --keep rrs_QC latitude longitude
+```
+
 | Option | Description | Default |
 |---|---|---|
 | `-i`, `--input` | Input netCDF file | required |
 | `-o`, `--output` | Output netCDF file (folders are created if needed) | required |
 | `-s`, `--sensor` | `OLCI`, `MERIS` or `MODIS` | one of `-s` / `-b` |
 | `-b`, `--bands` | Comma-separated custom bands, e.g. `"Rw443,Rw490,Rw560"` | one of `-s` / `-b` |
+| `-v`, `--variable` | Variable with a wavelength dimension to read the bands from | found automatically if there are no band variables (`Rw443`, …) |
+| `--dim` | Name of its wavelength dimension | recognised by its name |
+| `--keep` | Input variables to copy into the output, with their coordinates, e.g. `rrs_QC latitude` | none |
 | `--weights-file` | JSON file with custom OWT weights | packaged weights |
 | `--owt-file` | CSV file with custom reference OWT spectra | packaged library |
 | `--min-wsum` | Wsum mapped to COI = 0 | 223.0 |
@@ -189,11 +205,19 @@ coi -i input.nc -o output.nc -s OLCI --weights-file weights.json --owt-file refe
 coi -i input.nc -o output.nc -s MERIS --return-all
 ```
 
-The output variables are compressed (zlib, level 5), and the file has a `processing_date` attribute. If anything fails, the error is logged and the command exits with status 1.
+The wavelengths of a spectral variable can be given by a coordinate or data variable called `wavelength`, or by the dimension itself.
+
+Coordinates and `--keep` variables are copied with their stored types and values. Compound and variable-length numeric types cannot be copied. Only the root group of a netCDF-4 file is read.
+
+The output variables are compressed (zlib, level 5), and the file has `processing_date` (UTC) and `history` attributes. The command never overwrites its input file, and an existing output file is only replaced once the new one has been written completely. On a problem with the input, the options or the files, it logs the error and exits with status 1. `python -m coi` runs the same command.
 
 ---
 
 ## Python
+
+There are two entry points, one per [input layout](#input-data): `COI` for a Dataset with one variable per band, and `compute_coi` for an array with wavelengths.
+
+### One variable per band: `COI`
 
 ```python
 import xarray as xr
@@ -201,7 +225,11 @@ from coi import COI
 
 ds = xr.open_dataset("input.nc")
 
-result = COI(ds, sensor="OLCI").process_spectral_data()
+result = COI(
+    ds=ds,
+    sensor="OLCI",
+).process_spectral_data()
+
 result.to_netcdf("output.nc")
 ```
 
@@ -235,15 +263,81 @@ With `return_all=True`, the result also contains every `Rw*` variable of the inp
 
 `min_wsum` and `max_wsum` set the Wsum values that map to COI = 0 and COI = 1. They are fixed boundaries, not taken from your data (see [Method](#method)).
 
+### An array with wavelengths: `compute_coi`
+
+An `xarray.DataArray` gives the same Dataset as `COI`. Here with [satconv](https://github.com/davidelomeo/satconv):
+
+```python
+import xarray as xr
+from coi import compute_coi
+from convolution import convolve
+
+ds = xr.open_dataset("spectra.nc")
+
+olci = convolve(
+    ds["rrs"],
+    sensor="OLCI_S3A",
+)
+
+result = compute_coi(
+    olci,
+    sensor="OLCI",
+)
+```
+
+`compute_coi` takes the same `sensor`, `bands`, `w_owt`, `reference_owt`, `min_wsum`, `max_wsum`, `exp` and `valid_mask` options as `COI`, plus:
+
+| Option | Description | Default |
+|---|---|---|
+| `wavelengths` | Wavelengths (nm) of the input; required for NumPy | read from the coordinate or column names |
+| `dim` | Wavelength dimension of a DataArray | recognised by its name |
+| `return_scores` | Also return every OWT membership score | `False` |
+| `tolerance` | Largest distance (nm) between a band and the input wavelength used for it | 1.5 |
+
+### NumPy and pandas
+
+NumPy input has wavelength on the **last** axis, and returns arrays with the other axes:
+
+```python
+from coi import compute_coi
+
+result = compute_coi(
+    values,               # (..., n_wavelengths)
+    wavelengths=centres,  # nm
+    sensor="OLCI",
+)
+
+result.coi            # (...)
+result.wsum           # (...)
+result.dominant_owt   # (..., 3) OWT names, '' where there is no result
+result.scores         # (..., n_owt) with return_scores=True, otherwise None
+```
+
+A DataFrame with one row per observation and one column per wavelength returns a DataFrame with the same index, and the columns `wsum`, `coi` and `dominant_owt_1` to `dominant_owt_3`:
+
+```python
+table = compute_coi(
+    frame,
+    sensor="OLCI",
+)
+```
+
 ### Large files (dask)
 
 If `dask` is installed, open the file in chunks. The calculation then stays lazy and runs chunk by chunk, in parallel, when the result is written or computed:
 
 ```python
 ds = xr.open_dataset("big_scene.nc", chunks={"y": 2048, "x": 2048})
-result = COI(ds, sensor="OLCI").process_spectral_data()  # lazy, nothing computed yet
-result.to_netcdf("output.nc")                            # computed here
+
+result = COI(
+    ds=ds,
+    sensor="OLCI",
+).process_spectral_data()      # lazy, nothing computed yet
+
+result.to_netcdf("output.nc")  # computed here
 ```
+
+`compute_coi` is lazy in the same way for a dask-backed DataArray.
 
 ### Lower-level functions
 
@@ -282,6 +376,16 @@ The packaged files are in [`coi/core_files/`](coi/core_files): `OWT_inland_mean_
 
 ---
 
+## Upgrading from 0.3
+
+- Python 3.11+ and NumPy 2 are required.
+- `COI` and the command line give the same results as before, now always computed in double precision (also for `float32` input).
+- `processing_date` is now in UTC, and the command line adds a `history` attribute.
+- The command line shows a full traceback for unexpected errors, instead of only a log message.
+- New: `compute_coi`, and the `--variable`, `--dim` and `--keep` options.
+
+---
+
 ## Tests
 
 ```bash
@@ -292,7 +396,7 @@ pip install -e ".[test]"
 pytest
 ```
 
-The tests run automatically on GitHub Actions with Python 3.9 and 3.13.
+GitHub Actions runs the tests on Python 3.11 and 3.14, and lints with `ruff check`.
 
 ---
 
