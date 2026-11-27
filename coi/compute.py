@@ -13,6 +13,7 @@ import pandas
 import xarray
 from numpy.typing import ArrayLike
 
+from .calculate_wsum_and_coi import coi_from_own_range
 from .COI import COI, _process
 from .compute_spectral_angle import band_wavelengths
 
@@ -30,6 +31,7 @@ class CoiArrays(NamedTuple):
     coi: numpy.ndarray
     dominant_owt: numpy.ndarray  # (..., 3) OWT names, most similar first; '' without a result
     scores: numpy.ndarray | None  # (..., n_owt) Sowt, only with return_scores=True
+    coi_local: numpy.ndarray | None = None  # only with local_coi=True
 
 
 def compute_coi(
@@ -46,6 +48,7 @@ def compute_coi(
     exp: float = 1.0,
     valid_mask: Any = None,
     return_scores: bool = False,
+    local_coi: bool = False,
     tolerance: float = 1.5,
 ) -> Any:
     """Compute Wsum and COI from band reflectances arranged along wavelength.
@@ -69,15 +72,19 @@ def compute_coi(
         Pixels where it is False are returned as NaN.
     return_scores : bool
         Also return the membership score (Sowt) of every OWT.
+    local_coi : bool
+        Also return 'coi_local', the COI with the smallest and largest Wsum of ``spectra``
+        (after ``valid_mask``) as the boundaries. As for ``COI``.
     tolerance : float
         Each band uses the input wavelength closest to it, which must be within this many nm.
 
     Returns
     -------
     CoiArrays, xarray.Dataset or pandas.DataFrame
-        * NumPy input: ``CoiArrays(wsum, coi, dominant_owt, scores)``.
+        * NumPy input: ``CoiArrays(wsum, coi, dominant_owt, scores, coi_local)``.
         * DataArray input: Dataset like that of ``COI.process_spectral_data`` ('wsum', 'coi',
-          'dominant_owt_1' to '_3', plus 'sowt_*' with ``return_scores``), lazy if dask-backed.
+          'dominant_owt_1' to '_3', plus 'sowt_*' with ``return_scores`` and 'coi_local',
+          'wsum_local_min' and 'wsum_local_max' with ``local_coi``), lazy if dask-backed.
         * DataFrame input: the same names as columns, one row per observation.
     """
     if isinstance(spectra, xarray.Dataset):
@@ -97,7 +104,8 @@ def compute_coi(
         max_wsum=max_wsum,
         exp=exp,
         valid_mask=valid_mask,
-        return_all=return_scores)
+        return_all=return_scores,
+        local_coi=local_coi)
 
     if is_dataarray:
         calculator.ds = select_bands(
@@ -135,10 +143,15 @@ def compute_coi(
         coi.reshape(shape),
         model.name_lookup[dominant].reshape((*shape, model.n_dominant)),
         None if scores is None else scores.reshape((*shape, len(model.sowt_names))))
+    if local_coi:
+        own_range_coi, _, _ = coi_from_own_range(xarray.DataArray(result.wsum))
+        result = result._replace(coi_local=own_range_coi.values)
     if not is_dataframe:
         return result
 
     columns_out = {'wsum': result.wsum, 'coi': result.coi}
+    if local_coi:
+        columns_out['coi_local'] = result.coi_local
     if return_scores:
         columns_out |= dict(zip(model.sowt_names, result.scores.T, strict=True))
     columns_out |= {f'dominant_owt_{rank + 1}': result.dominant_owt[:, rank]

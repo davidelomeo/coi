@@ -31,6 +31,18 @@ The package ships the resulting 25-OWT library and weights, and applies the last
 
 The range is fixed: it is not taken from the Wsum values in your data, so COI values can be compared between scenes and dates. Wsum values outside the range give a COI of 0 or 1. The default range (`min_wsum = 223`, `max_wsum = 321`) was derived for OLCI. To use other boundaries, for example for other sensors or band sets, set `min_wsum` and `max_wsum` in Python, or `--min-wsum` and `--max-wsum` on the command line.
 
+### Local COI
+
+On request (`local_coi=True`, or `--local-coi` on the command line), the output also has `coi_local`, which takes its two boundaries from your data:
+
+COI_local = (Wsum − smallest Wsum) / (largest Wsum − smallest Wsum)
+
+`coi` is still returned, with the fixed range, so you get both. The two boundaries used are saved as `wsum_local_min` and `wsum_local_max` (in a Dataset or netCDF file; for NumPy and pandas input they are the smallest and largest value of `wsum`).
+
+- **It is relative to the data of one run:** the whole array or file you pass in. The pixel with the smallest Wsum is 0 and the one with the largest is 1, so values from different scenes, dates or files are **not** comparable. To share boundaries, combine the data first and run it once.
+- **Only pixels with a result count.** Pixels that are NaN or outside `valid_mask` are left out. A single poor-quality spectrum can otherwise set a boundary, so filter by quality: `valid_mask` in Python, `--valid-where` on the command line.
+- If there are not two different Wsum values (for example a single spectrum), `coi_local` is NaN.
+
 ## Results from the paper
 
 ![Histograms of COI, with the matching Wsum on the top axis, for oligotrophic, mesotrophic, eutrophic and hyper-eutrophic waters. Higher trophic states shift towards higher COI values.](docs/figures/coi_trophic_state_histogram.webp)
@@ -148,6 +160,8 @@ From the command line, `COI` and a DataArray, the output is an `xarray.Dataset` 
 |---|---|
 | `wsum` | Weighted sum of the OWT membership scores (Wsum) |
 | `coi` | Cyanobacteria Occurrence Index, between 0 and 1 |
+| `coi_local` | COI between the smallest and largest Wsum of the data, see [Local COI](#local-coi) (only with `local_coi` / `--local-coi`) |
+| `wsum_local_min`, `wsum_local_max` | The two boundaries of `coi_local`, one value each (only with `local_coi` / `--local-coi`) |
 | `dominant_owt_1`, `dominant_owt_2`, `dominant_owt_3` | Names of the three OWTs with the highest membership scores (Sowt), from highest to lowest, for example `6.2` |
 | `sowt_<OWT>` | Membership score of each OWT, between 0 and 1 (only with `return_all` / `--return-all` / `return_scores`) |
 | `Rw*` | The input bands (only with `return_all` / `--return-all`) |
@@ -169,7 +183,7 @@ satconv -i spectra.nc -o olci.nc -s OLCI_S3A -v rrs --range 412 779
 ```
 
 ```bash
-coi -i olci.nc -o coi.nc -s OLCI --keep rrs_QC latitude longitude
+coi -i olci.nc -o coi.nc -s OLCI --valid-where rrs_QC=1 --keep rrs_QC latitude longitude
 ```
 
 | Option | Description | Default |
@@ -180,6 +194,7 @@ coi -i olci.nc -o coi.nc -s OLCI --keep rrs_QC latitude longitude
 | `-b`, `--bands` | Comma-separated custom bands, e.g. `"Rw443,Rw490,Rw560"` | one of `-s` / `-b` |
 | `-v`, `--variable` | Variable with a wavelength dimension to read the bands from | found automatically if there are no band variables (`Rw443`, …) |
 | `--dim` | Name of its wavelength dimension | recognised by its name |
+| `--valid-where` | Only compute pixels where an input variable has a given value: `NAME=VALUE`, or `NAME=VALUE,VALUE` for any of several. Other pixels are NaN. Repeat it to require several conditions | every pixel |
 | `--keep` | Input variables to copy into the output, with their coordinates, e.g. `rrs_QC latitude` | none |
 | `--weights-file` | JSON file with custom OWT weights | packaged weights |
 | `--owt-file` | CSV file with custom reference OWT spectra | packaged library |
@@ -187,6 +202,7 @@ coi -i olci.nc -o coi.nc -s OLCI --keep rrs_QC latitude longitude
 | `--max-wsum` | Wsum mapped to COI = 1 | 321.0 |
 | `--exp` | Exponent of the fractionality term | 1.0 |
 | `--return-all` | Also write the input bands and every `sowt_*` score | off |
+| `--local-coi` | Also write [`coi_local`](#local-coi), with the boundaries taken from the input file | off |
 | `--version` | Print the version and exit | |
 
 More examples:
@@ -203,6 +219,9 @@ coi -i input.nc -o output.nc -s OLCI --weights-file weights.json --owt-file refe
 
 # Also keep the input bands and the OWT scores
 coi -i input.nc -o output.nc -s MERIS --return-all
+
+# Add the local COI, with the boundaries taken from the good-quality pixels of this file
+coi -i input.nc -o output.nc -s OLCI --local-coi --valid-where rrs_QC=1
 ```
 
 The wavelengths of a spectral variable can be given by a coordinate or data variable called `wavelength`, or by the dimension itself.
@@ -256,12 +275,13 @@ result = COI(
     exp=1.0,                   # exponent of the fractionality term
     valid_mask=ds["Rw443"] > 0,  # optional boolean DataArray; False -> NaN
     return_all=True,           # also return the input Rw* bands and every sowt_* score
+    local_coi=True,            # also return coi_local (boundaries from this data)
 ).process_spectral_data()
 ```
 
 With `return_all=True`, the result also contains every `Rw*` variable of the input and one `sowt_<OWT>` variable per reference OWT (for example `sowt_1.2`). Each `sowt_*` score is between 0 and 1, and 1 means the spectrum has exactly the shape of that OWT.
 
-`min_wsum` and `max_wsum` set the Wsum values that map to COI = 0 and COI = 1. They are fixed boundaries, not taken from your data (see [Method](#method)).
+`min_wsum` and `max_wsum` set the Wsum values that map to COI = 0 and COI = 1. They are fixed boundaries, not taken from your data (see [Method](#method)). With `local_coi=True` you also get the [local COI](#local-coi), which these two options do not affect.
 
 ### An array with wavelengths: `compute_coi`
 
@@ -285,7 +305,7 @@ result = compute_coi(
 )
 ```
 
-`compute_coi` takes the same `sensor`, `bands`, `w_owt`, `reference_owt`, `min_wsum`, `max_wsum`, `exp` and `valid_mask` options as `COI`, plus:
+`compute_coi` takes the same `sensor`, `bands`, `w_owt`, `reference_owt`, `min_wsum`, `max_wsum`, `exp`, `valid_mask` and `local_coi` options as `COI`, plus:
 
 | Option | Description | Default |
 |---|---|---|
@@ -311,9 +331,10 @@ result.coi            # (...)
 result.wsum           # (...)
 result.dominant_owt   # (..., 3) OWT names, '' where there is no result
 result.scores         # (..., n_owt) with return_scores=True, otherwise None
+result.coi_local      # (...) with local_coi=True, otherwise None
 ```
 
-A DataFrame with one row per observation and one column per wavelength returns a DataFrame with the same index, and the columns `wsum`, `coi` and `dominant_owt_1` to `dominant_owt_3`:
+A DataFrame with one row per observation and one column per wavelength returns a DataFrame with the same index, and the columns `wsum`, `coi` and `dominant_owt_1` to `dominant_owt_3` (plus `coi_local` with `local_coi=True`):
 
 ```python
 table = compute_coi(
@@ -382,7 +403,7 @@ The packaged files are in [`coi/core_files/`](coi/core_files): `OWT_inland_mean_
 - `COI` and the command line give the same results as before, now always computed in double precision (also for `float32` input).
 - `processing_date` is now in UTC, and the command line adds a `history` attribute.
 - The command line shows a full traceback for unexpected errors, instead of only a log message.
-- New: `compute_coi`, and the `--variable`, `--dim` and `--keep` options.
+- New: `compute_coi`, the [local COI](#local-coi), and the `--variable`, `--dim`, `--keep` and `--valid-where` options.
 
 ---
 
