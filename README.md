@@ -47,10 +47,6 @@ The range is fixed: it is not taken from the Wsum values in your data, so COI va
 
 `coi` needs Python 3.11 or newer. It installs numpy, pandas, xarray and netCDF4.
 
-> **The repository is private.** You need read access to `davidelomeo/coi` on GitHub, and git needs to be able to sign in. Use one of these:
-> - **HTTPS**: sign in once with the [GitHub CLI](https://cli.github.com/) (`gh auth login`, then `gh auth setup-git`). Then use the `https://` URLs below.
-> - **SSH**: if you have an SSH key on GitHub, replace `git+https://github.com/` with `git+ssh://git@github.com/` in the commands below.
-
 ### pip
 
 ```bash
