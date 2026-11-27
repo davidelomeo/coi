@@ -23,6 +23,20 @@ _BLOCK_SIZE = 262_144
 N_DOMINANT = 3
 
 
+def load_reference_owt() -> pandas.DataFrame:
+    """The reference OWT library, used by ``COI`` unless ``reference_owt`` is given.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per OLCI band (index 'wl', from 'Rw412' to 'Rw779') and one column per
+        optical water type ('OWT_<name>') holding its standardised mean spectrum. Each
+        call returns a new table, which can be changed and passed as ``reference_owt``.
+    """
+    with (_CORE_FILES / 'OWT_inland_mean_standardised_extended.csv').open('r') as f:
+        return pandas.read_csv(f, index_col='wl')
+
+
 class _Model(NamedTuple):
     """Everything the calculation needs apart from the data, prepared once."""
 
@@ -66,7 +80,7 @@ class COI:
         Weight of each OWT, keyed 'sowt_<OWT>'. Defaults to the packaged weights.
     reference_owt : pandas.DataFrame, optional
         Reference OWT spectra, band names as index and one 'OWT_<name>' column per OWT.
-        Defaults to the packaged 25-OWT inland water library.
+        Defaults to the packaged 25-OWT inland water library (``load_reference_owt()``).
     min_wsum, max_wsum : float
         Wsum values mapped to COI = 0 and COI = 1 (defaults derived from OLCI).
     exp : float
@@ -77,9 +91,10 @@ class COI:
         If True, also return the input 'Rw*' bands and every 'sowt_*' score.
     local_coi : bool
         If True, also return 'coi_local': the COI with the smallest and largest Wsum of this
-        data as the boundaries instead of ``min_wsum`` and ``max_wsum``. The two values used
-        are returned as 'wsum_local_min' and 'wsum_local_max'. Pixels that are masked or
-        have no result do not count. 'coi' is unaffected.
+        data as the boundaries instead of ``min_wsum`` and ``max_wsum``. With it come the
+        Wsum it was computed from, 'wsum_local' (the same values as 'wsum'), and the two
+        boundaries, 'wsum_local_min' and 'wsum_local_max'. Pixels that are masked or have
+        no result do not count. 'coi' is unaffected.
 
     The output always contains 'wsum', 'coi' and the names of the three OWTs with the
     highest membership scores ('dominant_owt_1' to 'dominant_owt_3').
@@ -138,7 +153,7 @@ class COI:
         self.bands = self._get_sensor_bands()
         self.w_owt = self._load_w_owt() if w_owt is None else w_owt
 
-        reference = self._load_reference_owt() if reference_owt is None else reference_owt
+        reference = load_reference_owt() if reference_owt is None else reference_owt
         if self.sensor == 'MODIS':
             # Label the reference rows with the matching MODIS band names
             reference = reference.rename(index=self.MODIS_BAND_MAP)
@@ -154,12 +169,6 @@ class COI:
         """Load the default OWT weights."""
         with (_CORE_FILES / 'w_owt.json').open('r') as f:
             return json.load(f)
-
-    @staticmethod
-    def _load_reference_owt() -> pandas.DataFrame:
-        """Load the default reference OWT library."""
-        with (_CORE_FILES / 'OWT_inland_mean_standardised_extended.csv').open('r') as f:
-            return pandas.read_csv(f, index_col='wl')
 
     def _get_sensor_bands(self) -> list[str]:
         """Bands to use, from the sensor name or the custom band list."""
@@ -211,7 +220,7 @@ class COI:
             'wsum', 'coi' and 'dominant_owt_1' to 'dominant_owt_3' (names of the OWTs with
             the highest Sowt, '' where there is no result). With ``return_all=True`` also
             the input 'Rw*' bands and the 'sowt_*' scores. With ``local_coi=True`` also
-            'coi_local', 'wsum_local_min' and 'wsum_local_max'.
+            'wsum_local', 'coi_local', 'wsum_local_min' and 'wsum_local_max'.
         """
         model = self._model()
         sowt_names, n_dominant = model.sowt_names, model.n_dominant
@@ -254,11 +263,14 @@ class COI:
         variables['coi'] = coi
         if self.local_coi:
             coi_local, low, high = coi_from_own_range(wsum)
+            wsum_local = wsum.copy()
+            wsum_local.attrs = {'long_name': 'Wsum of the local COI (same values as wsum)'}
             coi_local.attrs = {'long_name': 'Local COI: Wsum rescaled between its smallest and '
                                             'largest value in this data'}
             low.attrs = {'long_name': 'Smallest Wsum in this data (coi_local = 0)'}
             high.attrs = {'long_name': 'Largest Wsum in this data (coi_local = 1)'}
-            variables |= {'coi_local': coi_local, 'wsum_local_min': low, 'wsum_local_max': high}
+            variables |= {'wsum_local': wsum_local, 'coi_local': coi_local,
+                          'wsum_local_min': low, 'wsum_local_max': high}
         for rank in range(n_dominant):
             dominant = outputs[2 + rank]
             dominant.attrs['long_name'] = f'OWT with the {_ORDINALS[rank]} highest membership score (Sowt)'

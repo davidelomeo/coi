@@ -81,7 +81,8 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
                         help='Also write the input bands and all OWT scores, not only Wsum and COI')
     parser.add_argument('--local-coi', action='store_true',
                         help='Also write coi_local, the COI between the smallest and largest Wsum of '
-                             'the input file (coi still uses --min-wsum and --max-wsum)')
+                             'the input file, with wsum_local, wsum_local_min and wsum_local_max '
+                             '(coi still uses --min-wsum and --max-wsum)')
 
     return parser.parse_args(args)
 
