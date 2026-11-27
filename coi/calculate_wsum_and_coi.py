@@ -1,33 +1,29 @@
 """Weighted sum of OWT membership scores (Wsum) and Cyanobacteria Occurrence Index (COI)."""
 
-from typing import Dict, List, Tuple
-
 import numpy as np
 import xarray
 
 __all__ = ['calculate_wsum_and_coi']
 
 
-def owt_weights(sowt_names: List[str], w_owt: Dict) -> np.ndarray:
+def owt_weights(sowt_names: list[str], w_owt: dict) -> np.ndarray:
     """Weights in the order of ``sowt_names``, with a clear error if any are missing."""
     missing = [name for name in sowt_names if name not in w_owt]
     if missing:
         raise KeyError(f'OWT weights are missing entries for {missing}')
-    return np.array([w_owt[name] for name in sowt_names], dtype=float)
+    weights = np.array([w_owt[name] for name in sowt_names], dtype=float)
+    return np.where(np.isnan(weights), 0.0, weights)  # a weight left empty (None, NaN) counts as 0
 
 
 def wsum_and_coi(scores: np.ndarray, weights: np.ndarray, min_wsum: float, max_wsum: float,
-                 exp: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+                 exp: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
     """Wsum and COI from scores of shape (..., n_owt). Points with any NaN score are NaN."""
     with np.errstate(divide='ignore', invalid='ignore'):
-        valid = ~np.isnan(scores).any(axis=-1)
-
-        # Fractionality: each score's share of the (powered) total
+        # Wsum = sum(score * weight * fraction), where the fractionality of a score is its
+        # share of the (powered) total: score**exp / sum(score**exp)
         powered = scores ** exp
-        fractions = powered / powered.sum(axis=-1, keepdims=True)
-
-        wsum = np.where(valid, np.nansum(scores * weights * fractions, axis=-1), np.nan)
-        coi = np.where(valid, np.clip((wsum - min_wsum) / (max_wsum - min_wsum), 0, 1), np.nan)
+        wsum = (scores * powered) @ weights / powered.sum(axis=-1)
+        coi = np.clip((wsum - min_wsum) / (max_wsum - min_wsum), 0, 1)
     return wsum, coi
 
 
@@ -59,7 +55,8 @@ def calculate_wsum_and_coi(ds: xarray.Dataset, w_owt: dict, min_wsum: float, max
     scores = xarray.concat([ds[var] for var in sowt_vars], dim='sowt')
     wsum, coi = xarray.apply_ufunc(
         wsum_and_coi, scores,
-        kwargs=dict(weights=weights, min_wsum=float(min_wsum), max_wsum=float(max_wsum), exp=float(exp)),
+        kwargs={'weights': weights, 'min_wsum': float(min_wsum), 'max_wsum': float(max_wsum),
+                'exp': float(exp)},
         input_core_dims=[['sowt']], output_core_dims=[[], []],
         dask='parallelized', keep_attrs=False, output_dtypes=[float, float])
 

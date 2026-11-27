@@ -3,10 +3,14 @@
 import argparse
 import json
 import logging
+import os
+import re
 import sys
-from datetime import datetime
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import List, Optional
 
 import numpy
 import pandas
@@ -14,15 +18,29 @@ import xarray
 
 from . import __version__
 from .COI import COI
+from .compute import select_bands, wavelength_dim
 
 logger = logging.getLogger('coi')
 
+# Names of variables that hold one band each
+_BAND_VARIABLE = re.compile(r'Rw\d+(\.\d+)?(_mean)?')
 
-def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
+_EPILOG = """\
+The input holds either one variable per band (Rw412, Rw443, ...) or one variable with a
+wavelength dimension, such as the output of satconv:
+
+  satconv -i spectra.nc -o olci.nc -s OLCI_S3A -v rrs
+  coi -i olci.nc -o coi.nc -s OLCI --keep rrs_QC latitude longitude
+"""
+
+
+def parse_args(args: list[str] | None = None) -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         prog='coi',
-        description='Calculate the Cyanobacteria Occurrence Index (COI) from satellite data')
+        description='Calculate the Cyanobacteria Occurrence Index (COI) from satellite data',
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     parser.add_argument('--input', '-i', required=True,
                         help='Path to input netCDF file')
@@ -36,6 +54,13 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
     group.add_argument('--bands', '-b',
                        help='Comma-separated list of bands (e.g., "Rw443,Rw490,Rw560")')
 
+    parser.add_argument('--variable', '-v',
+                        help="Variable with a wavelength dimension to read the bands from; found "
+                             "automatically if the input has no band variables ('Rw443', ...)")
+    parser.add_argument('--dim',
+                        help='Name of its wavelength dimension, if it cannot be recognised')
+    parser.add_argument('--keep', nargs='+', default=[], metavar='NAME',
+                        help='Input variables to copy into the output, e.g. rrs_QC latitude')
     parser.add_argument('--weights-file',
                         help='Path to JSON file containing custom OWT weights')
     parser.add_argument('--owt-file',
@@ -54,7 +79,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def _ascii_text_as_bytes(ds: xarray.Dataset) -> xarray.Dataset:
-    """Convert in-memory ASCII text variables to bytes, ready to be written to netCDF.
+    """Convert in-memory ASCII text stored as characters ('S1') to bytes, ready to be written.
 
     xarray converts text to bytes one value at a time, which takes seconds on large scenes.
     For ASCII text (such as OWT names) the whole array can be converted at once. The file
@@ -63,7 +88,8 @@ def _ascii_text_as_bytes(ds: xarray.Dataset) -> xarray.Dataset:
     """
     ds = ds.copy()
     for name, var in ds.data_vars.items():
-        if var.dtype.kind != 'U' or var.chunks is not None or var.ndim == 0 or var.dtype.itemsize == 0:
+        if (var.encoding.get('dtype') != 'S1' or var.dtype.kind != 'U' or var.chunks is not None
+                or var.ndim == 0 or var.dtype.itemsize == 0):
             continue
         code_points = numpy.ascontiguousarray(var.values).view(numpy.uint32)
         if code_points.size and code_points.max() >= 128:
@@ -74,19 +100,116 @@ def _ascii_text_as_bytes(ds: xarray.Dataset) -> xarray.Dataset:
     return ds
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def _wavelength_variable(ds: xarray.Dataset, dim: str | None) -> str | None:
+    """The variable to read bands from, or None if the input has one variable per band."""
+    if dim is None and any(_BAND_VARIABLE.fullmatch(str(name)) for name in ds.data_vars):
+        return None
+    found = []
+    for name, data in ds.data_vars.items():
+        try:
+            wavelength_dim(data, dim)
+        except ValueError:
+            continue
+        found.append(name)
+    if len(found) > 1:
+        raise ValueError(f'Several variables have wavelengths; choose with --variable: {", ".join(found)}')
+    if dim is not None and not found:
+        raise ValueError(f'No variable has a dimension {dim!r}')
+    return found[0] if found else None
+
+
+def _with_stored_variables(result: xarray.Dataset, path: str, ds: xarray.Dataset,
+                           keep: list[str]) -> xarray.Dataset:
+    """The result, with everything that comes from the input written exactly as stored there.
+
+    That covers the coordinates carried over from the input and the variables named in
+    ``--keep`` with their coordinates. They are read a second time, without decoding.
+    """
+    carried = [name for name in result.coords if name in ds.variables]
+    added = [name for kept in keep if kept not in result.variables
+             for name in (kept, *ds[kept].coords) if name not in result.variables]
+    with xarray.open_dataset(path, decode_cf=False) as stored:
+        for name in dict.fromkeys([*carried, *added]):
+            variable = stored.variables[name]
+            if not _can_copy(variable):
+                raise ValueError(f'{name} has a compound or variable-length type, '
+                                 'which cannot be copied')
+            copied = _as_stored(variable).load()
+            if name in result.coords:
+                result = result.assign_coords({name: copied})
+            else:
+                result[name] = copied
+    return result
+
+
+def _can_copy(variable: xarray.Variable) -> bool:
+    """Whether a variable's type can be written again (not compound or variable-length)."""
+    if variable.dtype.names:
+        return False
+    # A variable-length type only shows once a value is read
+    first = variable[tuple(slice(0, 1) for _ in variable.dims)].values
+    return not (first.dtype == object and first.size and isinstance(first.flat[0], numpy.ndarray))
+
+
+def _as_stored(variable: xarray.Variable) -> xarray.Variable:
+    """An undecoded input variable, set up so that writing it reproduces what is in the file."""
+    dims, data = variable.dims, variable.data
+    encoding = {key: value for key, value in variable.encoding.items() if key == 'dtype'}
+    if variable.dtype == 'S1' and dims and variable.shape[-1]:
+        # Join the characters into strings here: otherwise writing them adds a dimension
+        characters = numpy.ascontiguousarray(variable.values)
+        data = characters.view(f'S{characters.shape[-1]}').reshape(characters.shape[:-1])
+        encoding, dims = {'char_dim_name': dims[-1]}, dims[:-1]
+    if '_FillValue' not in variable.attrs:
+        encoding['_FillValue'] = None  # otherwise xarray adds one to floating point variables
+    return xarray.Variable(dims, data, variable.attrs, encoding)
+
+
+@contextmanager
+def _replacing(path: Path) -> Iterator[Path]:
+    """A scratch path that takes the place of ``path`` only if the block finishes without error.
+
+    A write that fails therefore leaves an existing file as it was, and no partial file.
+    """
+    target = path.resolve()  # writing to a link updates the file it points to
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.coi-', dir=target.parent) as folder:
+        scratch = Path(folder) / target.name
+        yield scratch
+        scratch.replace(target)
+
+
+def main(argv: list[str] | None = None) -> None:
     """Run the COI calculation from the command line."""
     args = parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     try:
-        logger.info(f'Loading input file: {args.input}')
-        ds = xarray.open_dataset(args.input)
+        _run(args)
+    except (OSError, KeyError, ValueError, RuntimeError) as e:
+        logger.error(f'Error during processing: {e}')
+        sys.exit(1)
+
+
+def _run(args: argparse.Namespace) -> None:
+    # The shell does not expand '~' in --input=~/file
+    input_path = os.path.expanduser(args.input)  # kept as text: it can also be a URL
+    output_path = Path(args.output).expanduser()
+    logger.info(f'Loading input file: {input_path}')
+    with xarray.open_dataset(input_path) as ds:
+        input_is_file = os.path.exists(input_path)
+        if input_is_file and output_path.exists() and output_path.samefile(input_path):
+            raise ValueError('The output file must not be the input file')
+        if 'wavelength' in ds.data_vars and ds['wavelength'].ndim == 1:
+            ds = ds.set_coords('wavelength')
+        unknown = [name for name in args.keep if name not in ds.variables]
+        if unknown:
+            raise KeyError(f'--keep: no variable {", ".join(unknown)} in the input')
 
         w_owt = None
         if args.weights_file:
             logger.info(f'Loading custom weights from: {args.weights_file}')
-            with open(args.weights_file, 'r') as f:
+            with open(args.weights_file) as f:
                 w_owt = json.load(f)
 
         reference_owt = None
@@ -107,23 +230,33 @@ def main(argv: Optional[List[str]] = None) -> None:
             exp=args.exp,
             return_all=args.return_all)
 
+        variable = args.variable or _wavelength_variable(ds, args.dim)
+        if variable is not None:
+            if variable not in ds.data_vars:
+                raise KeyError(f'No variable {variable} in the input')
+            logger.info(f'Reading bands from variable: {variable}')
+            coi_calc.ds = select_bands(ds[variable], coi_calc.bands, dim=args.dim)
+
         logger.info('Processing input data')
         result_ds = coi_calc.process_spectral_data()
-        result_ds.attrs['processing_date'] = datetime.now().isoformat()
+        result_ds = _with_stored_variables(result_ds, input_path, ds, args.keep)
 
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(UTC)
+        entry = f'{now:%Y-%m-%dT%H:%M:%SZ} coi {__version__}'
+        history = ds.attrs.get('history')
+        result_ds.attrs['processing_date'] = now.isoformat()
+        result_ds.attrs['history'] = f'{history}\n{entry}' if history else entry
+
         logger.info(f'Saving to {output_path}')
         result_ds = _ascii_text_as_bytes(result_ds)
-        # Keep each variable's own encoding (e.g. how text is stored) and add compression
-        encoding = {var: {**result_ds[var].encoding, 'zlib': True, 'complevel': 5}
-                    for var in result_ds.data_vars}
-        result_ds.to_netcdf(output_path, encoding=encoding)
+        # Keep each variable's own encoding (e.g. how text is stored) and add compression,
+        # which netCDF does not allow for variable-length text
+        encoding = {name: {**data.encoding, 'zlib': True, 'complevel': 5}
+                    for name, data in result_ds.data_vars.items()
+                    if data.dtype.kind not in 'UO' or data.encoding.get('dtype') == 'S1'}
+        with _replacing(output_path) as scratch:
+            result_ds.to_netcdf(scratch, encoding=encoding)
         logger.info('Processing completed successfully')
-
-    except Exception as e:
-        logger.error(f'Error during processing: {e}')
-        sys.exit(1)
 
 
 if __name__ == '__main__':
