@@ -30,7 +30,7 @@ The input holds either one variable per band (Rw412, Rw443, ...) or one variable
 wavelength dimension, such as the output of satconv:
 
   satconv -i spectra.nc -o olci.nc -s OLCI_S3A -v rrs
-  coi -i olci.nc -o coi.nc -s OLCI --keep rrs_QC latitude longitude
+  coi -i olci.nc -o coi.nc -s OLCI --valid-where rrs_QC=1 --keep rrs_QC latitude longitude
 """
 
 
@@ -61,6 +61,11 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
                         help='Name of its wavelength dimension, if it cannot be recognised')
     parser.add_argument('--keep', nargs='+', default=[], metavar='NAME',
                         help='Input variables to copy into the output, e.g. rrs_QC latitude')
+    parser.add_argument('--valid-where', action='append', type=_condition, default=[],
+                        metavar='NAME=VALUE',
+                        help='Only compute pixels where this input variable has this value, e.g. '
+                             'rrs_QC=1 (several values: rrs_QC=1,2). Other pixels are NaN. '
+                             'Repeat the option to require several conditions')
     parser.add_argument('--weights-file',
                         help='Path to JSON file containing custom OWT weights')
     parser.add_argument('--owt-file',
@@ -74,8 +79,44 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
                         help='Exponent used in the computation of the proportionality factor (default: 1.0)')
     parser.add_argument('--return-all', action='store_true',
                         help='Also write the input bands and all OWT scores, not only Wsum and COI')
+    parser.add_argument('--local-coi', action='store_true',
+                        help='Also write coi_local, the COI between the smallest and largest Wsum of '
+                             'the input file (coi still uses --min-wsum and --max-wsum)')
 
     return parser.parse_args(args)
+
+
+def _condition(text: str) -> tuple[str, list[float]]:
+    """A --valid-where condition, 'NAME=VALUE[,VALUE...]', as the name and the values."""
+    name, _, values = text.partition('=')
+    try:
+        numbers = [float(value) for value in values.split(',')]
+    except ValueError:
+        numbers = []
+    if not name or not numbers:
+        raise argparse.ArgumentTypeError(f'expected NAME=VALUE, such as rrs_QC=1, not {text!r}')
+    return name, numbers
+
+
+def _valid_mask(ds: xarray.Dataset, conditions: list[tuple[str, list[float]]],
+                dims: tuple) -> xarray.DataArray:
+    """True for the pixels that meet every --valid-where condition.
+
+    ``dims`` are the dimensions of the pixels; a condition cannot use any other.
+    """
+    mask = xarray.DataArray(True)
+    for name, values in conditions:
+        if name not in ds.variables:
+            raise KeyError(f'--valid-where: no variable {name} in the input')
+        data = ds[name]
+        if data.dtype.kind not in 'biuf':
+            raise ValueError(f'--valid-where: {name} is not a number variable')
+        extra = [str(dim) for dim in data.dims if dim not in dims]
+        if extra:
+            raise ValueError(f'--valid-where: {name} has dimension {", ".join(extra)}, which the '
+                             'pixels do not have')
+        mask = mask & data.isin(values)
+    return mask
 
 
 def _ascii_text_as_bytes(ds: xarray.Dataset) -> xarray.Dataset:
@@ -228,7 +269,8 @@ def _run(args: argparse.Namespace) -> None:
             min_wsum=args.min_wsum,
             max_wsum=args.max_wsum,
             exp=args.exp,
-            return_all=args.return_all)
+            return_all=args.return_all,
+            local_coi=args.local_coi)
 
         variable = args.variable or _wavelength_variable(ds, args.dim)
         if variable is not None:
@@ -236,6 +278,12 @@ def _run(args: argparse.Namespace) -> None:
                 raise KeyError(f'No variable {variable} in the input')
             logger.info(f'Reading bands from variable: {variable}')
             coi_calc.ds = select_bands(ds[variable], coi_calc.bands, dim=args.dim)
+
+        if args.valid_where:
+            pixel_dims = coi_calc.ds[coi_calc._band_variables()[0]].dims
+            coi_calc.valid_mask = _valid_mask(ds, args.valid_where, pixel_dims)
+            logger.info(f'--valid-where: {int(coi_calc.valid_mask.sum())} of '
+                        f'{coi_calc.valid_mask.size} values meet the conditions')
 
         logger.info('Processing input data')
         result_ds = coi_calc.process_spectral_data()

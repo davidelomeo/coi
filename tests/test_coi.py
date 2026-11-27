@@ -322,7 +322,7 @@ def test_numpy_input_matches_class(ds, kwargs):
 
 
 def test_numpy_single_spectrum_and_empty_input(ds):
-    wsum, coi_value, dominant, _ = compute_coi(cube_of(ds)[5, 7], OLCI_WL, sensor='olci')
+    wsum, coi_value, dominant, *_ = compute_coi(cube_of(ds)[5, 7], OLCI_WL, sensor='olci')
     expected, _ = slow_reference(spectrum_at(ds, OLCI, 5, 7), OLCI, REFERENCE, WEIGHTS)
     assert wsum.shape == coi_value.shape == () and dominant.shape == (3,)
     assert float(wsum) == pytest.approx(expected, rel=1e-6)
@@ -446,6 +446,82 @@ def test_hyperspectral_input_warns(ds):
         compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI')
 
 
+def own_range(wsum):
+    return (wsum - np.nanmin(wsum)) / (np.nanmax(wsum) - np.nanmin(wsum))
+
+
+def test_local_coi_dataset(ds):
+    plain = COI(ds, sensor='OLCI').process_spectral_data()
+    out = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
+    assert list(plain.data_vars) == ['wsum', 'coi', *DOMINANT]
+    assert list(out.data_vars) == ['wsum', 'coi', 'coi_local', 'wsum_local_min', 'wsum_local_max', *DOMINANT]
+    xr.testing.assert_identical(out[list(plain.data_vars)], plain)  # the global COI is unchanged
+    wsum = plain['wsum'].values
+    assert out['wsum_local_min'].ndim == 0 and out['wsum_local_min'] == np.nanmin(wsum)
+    assert out['wsum_local_max'] == np.nanmax(wsum)
+    np.testing.assert_allclose(out['coi_local'], own_range(wsum))
+    assert np.nanmin(out['coi_local']) == 0 and np.nanmax(out['coi_local']) == 1
+    assert np.isnan(out['coi_local'][0, 0])
+
+
+def test_local_coi_ignores_the_global_boundaries(ds):
+    default = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
+    moved = COI(ds, sensor='OLCI', local_coi=True,
+                min_wsum=0.0, max_wsum=1000.0).process_spectral_data()
+    xr.testing.assert_identical(moved['coi_local'], default['coi_local'])
+    assert not np.allclose(moved['coi'], default['coi'], equal_nan=True)
+
+
+def test_local_coi_boundaries_skip_masked_pixels(ds):
+    wsum = COI(ds, sensor='OLCI').process_spectral_data()['wsum']
+    # Leave out the pixels holding the smallest and the largest Wsum
+    mask = (wsum > wsum.min()) & (wsum < wsum.max())
+    result = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI', valid_mask=mask.values, local_coi=True)
+    kept = np.where(mask, wsum, np.nan)
+    np.testing.assert_allclose(result.coi_local, own_range(kept))
+    assert np.nanmin(result.coi_local) == 0 and np.nanmax(result.coi_local) == 1
+
+
+@pytest.mark.parametrize('cube_slice', [
+    np.s_[5, 7],           # one spectrum
+    np.s_[0, :2],          # no spectrum with a result
+    np.s_[0:0, :],         # no spectrum at all
+    np.s_[[5, 5], [7, 7]],  # twice the same value
+])
+def test_local_coi_without_a_range_is_nan(ds, cube_slice):
+    cube = cube_of(ds)[cube_slice]
+    data = xr.DataArray(cube, dims=[*'ab'[:cube.ndim - 1], 'wavelength'], coords={'wavelength': OLCI_WL})
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        result = compute_coi(cube, OLCI_WL, sensor='OLCI', local_coi=True)
+        labelled = compute_coi(data, sensor='OLCI', local_coi=True)
+    assert result.coi_local.shape == cube.shape[:-1] and np.isnan(result.coi_local).all()
+    assert np.isnan(labelled['coi_local']).all()
+
+
+def test_local_coi_array_and_table_inputs(ds):
+    expected = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
+    assert compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI').coi_local is None
+    result = compute_coi(cube_of(ds), OLCI_WL, sensor='OLCI', local_coi=True)
+    np.testing.assert_allclose(result.coi_local, expected['coi_local'])
+    xr.testing.assert_allclose(
+        compute_coi(spectral_dataarray(ds), sensor='OLCI', local_coi=True), expected)
+
+    frame = pd.DataFrame(cube_of(ds).reshape(-1, len(OLCI)), columns=OLCI_WL)
+    table = compute_coi(frame, sensor='OLCI', local_coi=True)
+    assert list(table.columns) == ['wsum', 'coi', 'coi_local', *DOMINANT]
+    np.testing.assert_allclose(table['coi_local'], expected['coi_local'].values.ravel())
+
+
+def test_local_coi_with_dask_uses_all_chunks_and_is_lazy(ds):
+    pytest.importorskip('dask')
+    data = spectral_dataarray(ds)
+    lazy = compute_coi(data.chunk({'y': 5, 'x': 6}), sensor='OLCI', local_coi=True)
+    for name in ('coi_local', 'wsum_local_min', 'wsum_local_max'):
+        assert lazy[name].chunks is not None
+    xr.testing.assert_allclose(lazy.compute(), compute_coi(data, sensor='OLCI', local_coi=True))
+
+
 @pytest.fixture
 def spectral_file(ds, tmp_path):
     """A file laid out like satconv output: one spectral variable plus per-observation data."""
@@ -478,6 +554,82 @@ def test_cli_return_all_from_wavelength_variable(spectral_file, tmp_path):
     main(['-i', str(spectral_file), '-o', str(out), '-s', 'OLCI', '--return-all'])
     with xr.open_dataset(out) as result:
         assert set(OLCI) <= set(result.data_vars) and 'sowt_5' in result
+
+
+def test_cli_local_coi(ds, spectral_file, tmp_path):
+    out = tmp_path / 'local.nc'
+    main(['-i', str(spectral_file), '-o', str(out), '-s', 'OLCI', '--local-coi'])
+    expected = COI(ds, sensor='OLCI', local_coi=True).process_spectral_data()
+    with xr.open_dataset(out) as result:
+        assert list(result.data_vars) == list(expected.data_vars)
+        for name in ('coi', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
+            np.testing.assert_allclose(result[name], expected[name])
+
+
+@pytest.fixture
+def flagged_file(ds, tmp_path):
+    """Spectra with a quality flag per pixel (1 to 4) and one per row."""
+    flags = np.arange(12 * 15, dtype=np.int16).reshape(12, 15) % 4 + 1
+    scene = xr.Dataset(
+        {'rrs': spectral_dataarray(ds), 'flag': (('y', 'x'), flags),
+         'row_flag': ('y', np.arange(12) % 2),
+         'band_flag': ('wavelength', np.ones(len(OLCI))),
+         'note': ('y', ['good'] * 12)})
+    path = tmp_path / 'flagged.nc'
+    scene.to_netcdf(path)
+    return path
+
+
+@pytest.mark.parametrize('options, keep', [
+    (['--valid-where', 'flag=1'], lambda flag, row: flag == 1),
+    (['--valid-where', 'flag=1,2'], lambda flag, row: flag <= 2),
+    (['--valid-where', 'row_flag=1'], lambda flag, row: row == 1),
+    (['--valid-where', 'flag=1,2', '--valid-where', 'row_flag=1'],
+     lambda flag, row: (flag <= 2) & (row == 1)),
+    (['--valid-where', 'flag=9'], lambda flag, row: flag == 9),
+])
+def test_cli_valid_where(ds, flagged_file, tmp_path, options, keep):
+    out = tmp_path / 'valid.nc'
+    main(['-i', str(flagged_file), '-o', str(out), '-s', 'OLCI', '-v', 'rrs', '--local-coi', *options])
+    with xr.open_dataset(flagged_file) as source:
+        mask = keep(source['flag'], source['row_flag']).broadcast_like(source['flag'])
+        mask = mask.transpose('y', 'x').load()
+    expected = COI(ds, sensor='OLCI', valid_mask=mask, local_coi=True).process_spectral_data()
+    with xr.open_dataset(out) as result:
+        assert result['coi'].dims == ('y', 'x')
+        for name in ('coi', 'coi_local', 'wsum_local_min', 'wsum_local_max'):
+            np.testing.assert_allclose(result[name], expected[name])
+        assert np.isnan(result['coi'].values[~mask.values]).all()
+
+
+def test_cli_valid_where_with_band_variables(ds, tmp_path):
+    src, out = tmp_path / 'bands.nc', tmp_path / 'coi.nc'
+    ds.assign(flag=('x', np.arange(15) % 2)).to_netcdf(src)
+    main(['-i', str(src), '-o', str(out), '-s', 'OLCI', '--valid-where', 'flag=0'])
+    with xr.open_dataset(out) as result:
+        assert np.isnan(result['coi'][:, 1::2]).all()
+        assert np.isfinite(result['coi'][5, 0::2]).all()
+
+
+@pytest.mark.parametrize('condition, message', [
+    ('nope=1', 'no variable nope'),
+    ('note=1', 'note is not a number variable'),
+    ('band_flag=1', 'band_flag has dimension wavelength'),
+])
+def test_cli_valid_where_errors(flagged_file, tmp_path, caplog, condition, message):
+    with pytest.raises(SystemExit) as exc:
+        main(['-i', str(flagged_file), '-o', str(tmp_path / 'x.nc'), '-s', 'OLCI', '-v', 'rrs',
+              '--valid-where', condition])
+    assert exc.value.code == 1 and message in caplog.text
+    assert not (tmp_path / 'x.nc').exists()
+
+
+@pytest.mark.parametrize('condition', ['flag', 'flag=', '=1', 'flag=good', 'flag=1,'])
+def test_cli_valid_where_syntax(flagged_file, tmp_path, capsys, condition):
+    with pytest.raises(SystemExit) as exc:
+        main(['-i', str(flagged_file), '-o', str(tmp_path / 'x.nc'), '-s', 'OLCI',
+              '--valid-where', condition])
+    assert exc.value.code == 2 and 'expected NAME=VALUE' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('extra, message', [

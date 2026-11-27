@@ -27,6 +27,22 @@ def wsum_and_coi(scores: np.ndarray, weights: np.ndarray, min_wsum: float, max_w
     return wsum, coi
 
 
+def coi_from_own_range(
+    wsum: xarray.DataArray,
+) -> tuple[xarray.DataArray, xarray.DataArray, xarray.DataArray]:
+    """COI with the smallest and largest value of ``wsum`` itself as the boundaries.
+
+    Returns the COI and the two boundaries (smallest, largest). The COI is NaN where Wsum is
+    NaN, and everywhere if there are not two different values. Lazy if dask-backed.
+    """
+    if wsum.size:
+        low, high = wsum.min(), wsum.max()  # NaN (masked and invalid pixels) is skipped
+    else:
+        low, high = xarray.DataArray(np.nan), xarray.DataArray(np.nan)
+    span = high - low
+    return (wsum - low) / span.where(span > 0), low, high
+
+
 def calculate_wsum_and_coi(ds: xarray.Dataset, w_owt: dict, min_wsum: float, max_wsum: float,
                            exp: float = 1.0) -> xarray.Dataset:
     """Calculate Wsum and COI from the 'sowt_*' variables of a Dataset.

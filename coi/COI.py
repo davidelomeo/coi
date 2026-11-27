@@ -9,7 +9,7 @@ import numpy
 import pandas
 import xarray
 
-from .calculate_wsum_and_coi import owt_weights, wsum_and_coi
+from .calculate_wsum_and_coi import coi_from_own_range, owt_weights, wsum_and_coi
 from .compute_spectral_angle import band_wavelengths, prepare_reference, spectral_scores
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,11 @@ class COI:
         Boolean mask; pixels where it is False are returned as NaN.
     return_all : bool
         If True, also return the input 'Rw*' bands and every 'sowt_*' score.
+    local_coi : bool
+        If True, also return 'coi_local': the COI with the smallest and largest Wsum of this
+        data as the boundaries instead of ``min_wsum`` and ``max_wsum``. The two values used
+        are returned as 'wsum_local_min' and 'wsum_local_max'. Pixels that are masked or
+        have no result do not count. 'coi' is unaffected.
 
     The output always contains 'wsum', 'coi' and the names of the three OWTs with the
     highest membership scores ('dominant_owt_1' to 'dominant_owt_3').
@@ -117,7 +122,8 @@ class COI:
         max_wsum: float = 321.0,
         exp: float = 1.0,
         valid_mask: xarray.DataArray | None = None,
-        return_all: bool = False) -> None:
+        return_all: bool = False,
+        local_coi: bool = False) -> None:
 
         self.ds = ds
         self.sensor = sensor.upper() if sensor is not None else None
@@ -127,6 +133,7 @@ class COI:
         self.exp = float(exp)
         self.valid_mask = valid_mask
         self.return_all = return_all
+        self.local_coi = local_coi
 
         self.bands = self._get_sensor_bands()
         self.w_owt = self._load_w_owt() if w_owt is None else w_owt
@@ -203,7 +210,8 @@ class COI:
         xarray.Dataset
             'wsum', 'coi' and 'dominant_owt_1' to 'dominant_owt_3' (names of the OWTs with
             the highest Sowt, '' where there is no result). With ``return_all=True`` also
-            the input 'Rw*' bands and the 'sowt_*' scores.
+            the input 'Rw*' bands and the 'sowt_*' scores. With ``local_coi=True`` also
+            'coi_local', 'wsum_local_min' and 'wsum_local_max'.
         """
         model = self._model()
         sowt_names, n_dominant = model.sowt_names, model.n_dominant
@@ -244,6 +252,13 @@ class COI:
                 variables[name] = outputs[-1].isel(owt=i)
         variables['wsum'] = wsum
         variables['coi'] = coi
+        if self.local_coi:
+            coi_local, low, high = coi_from_own_range(wsum)
+            coi_local.attrs = {'long_name': 'Local COI: Wsum rescaled between its smallest and '
+                                            'largest value in this data'}
+            low.attrs = {'long_name': 'Smallest Wsum in this data (coi_local = 0)'}
+            high.attrs = {'long_name': 'Largest Wsum in this data (coi_local = 1)'}
+            variables |= {'coi_local': coi_local, 'wsum_local_min': low, 'wsum_local_max': high}
         for rank in range(n_dominant):
             dominant = outputs[2 + rank]
             dominant.attrs['long_name'] = f'OWT with the {_ORDINALS[rank]} highest membership score (Sowt)'
